@@ -46,10 +46,43 @@
     </div>
 
     <script>
-      const apiBase = window.location.origin;
+      const API_BASE_CANDIDATES = Array.from(
+        new Set(
+          [window.location.origin, "http://127.0.0.1:8844", "http://127.0.0.1:8000"].filter(
+            (x) => x && x !== "null"
+          )
+        )
+      );
       const state = {
         sessionId: sessionStorage.getItem("teamCopilotSessionId") || "",
+        apiBase: API_BASE_CANDIDATES[0],
       };
+
+      async function apiFetch(path, options = {}) {
+        let lastErr = null;
+        for (const base of API_BASE_CANDIDATES) {
+          try {
+            const res = await fetch(`${base}${path}`, options);
+            const raw = await res.text();
+            let data = {};
+            try {
+              data = raw ? JSON.parse(raw) : {};
+            } catch (_err) {
+              data = { detail: raw.slice(0, 180) };
+            }
+            const looksLikeHtml = /^\s*</.test(raw || "");
+            if (looksLikeHtml && !res.headers.get("content-type")?.includes("application/json")) {
+              lastErr = new Error(`Non-JSON response from ${base}${path}`);
+              continue;
+            }
+            state.apiBase = base;
+            return { ok: res.ok, status: res.status, data };
+          } catch (err) {
+            lastErr = err;
+          }
+        }
+        throw lastErr || new Error("Could not connect to backend API.");
+      }
 
       function appendChatBubble(role, text) {
         const chat = document.getElementById("chatHistory");
@@ -310,14 +343,13 @@
         appendChatBubble("user", question);
         const typing = showTypingIndicator();
         try {
-          const res = await fetch(`${apiBase}/ask`, {
+          const { ok, data } = await apiFetch("/ask", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ question, session_id: state.sessionId || null }),
           });
-          const data = await res.json();
           typing.remove();
-          if (!res.ok) throw new Error(data.detail || "Copilot request failed");
+          if (!ok) throw new Error(data.detail || "Copilot request failed");
           if (data.session_id) {
             state.sessionId = data.session_id;
             sessionStorage.setItem("teamCopilotSessionId", state.sessionId);

@@ -1,7 +1,15 @@
-/** Same host/port as this page (works on any port, e.g. 8844 Desktop launcher). */
-const apiBase = window.location.origin;
+/** Prefer same origin, but auto-fallback to known local API ports. */
+const API_BASE_CANDIDATES = Array.from(
+  new Set(
+    [window.location.origin, "http://127.0.0.1:8844", "http://127.0.0.1:8000"].filter(
+      (x) => x && x !== "null"
+    )
+  )
+);
+const ACTIVE_DATASET_KEY = "activeDatasetName";
 const state = {
-  activeDataset: "None",
+  apiBase: API_BASE_CANDIDATES[0],
+  activeDataset: localStorage.getItem(ACTIVE_DATASET_KEY) || "None",
   summary: null,
   records: [],
   sessionId: sessionStorage.getItem("copilotSessionId") || "",
@@ -9,7 +17,40 @@ const state = {
   hasActiveDataset: false,
   currentReportType: "aging",
   currentReportRows: [],
+  charts: {
+    outstanding: null,
+    overdue: null,
+    riskByRegion: null,
+    agingBucket: null,
+  },
 };
+
+async function apiFetch(path, options = {}) {
+  let lastErr = null;
+  for (const base of API_BASE_CANDIDATES) {
+    try {
+      const res = await fetch(`${base}${path}`, options);
+      const raw = await res.text();
+      let data = {};
+      try {
+        data = raw ? JSON.parse(raw) : {};
+      } catch (_err) {
+        data = { detail: raw.slice(0, 180) };
+      }
+      // If this endpoint returned HTML, it is likely not the backend API on this port.
+      const looksLikeHtml = /^\s*</.test(raw || "");
+      if (looksLikeHtml && !res.headers.get("content-type")?.includes("application/json")) {
+        lastErr = new Error(`Non-JSON response from ${base}${path}`);
+        continue;
+      }
+      state.apiBase = base;
+      return { ok: res.ok, status: res.status, data };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("Could not connect to backend API.");
+}
 
 function currency(v) {
   return `$${Number(v || 0).toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
@@ -36,6 +77,12 @@ function riskBadge(score) {
 
 function setCopilotInsightPlaceholders() {}
 
+function setDashboardLoading(loading) {
+  const shell = document.getElementById("appShell");
+  if (!shell) return;
+  shell.classList.toggle("loading", Boolean(loading));
+}
+
 function clearKpiPlaceholders() {
   document.getElementById("kpiTotalDue").textContent = "-";
   document.getElementById("kpiTotalInvoices").textContent = "-";
@@ -46,14 +93,13 @@ function clearKpiPlaceholders() {
 
 async function fetchSummary() {
   try {
-    const res = await fetch(`${apiBase}/summary`, { cache: "no-store" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
+    setDashboardLoading(true);
+    const { ok, data } = await apiFetch("/summary", { cache: "no-store" });
+    if (!ok) {
       state.hasActiveDataset = false;
       state.summary = null;
       clearKpiPlaceholders();
-      state.activeDataset = "None";
-      document.getElementById("activeDataset").textContent = "None";
+      document.getElementById("activeDataset").textContent = state.activeDataset || "None";
       document.getElementById("dataStatusText").textContent =
         typeof data.detail === "string"
           ? data.detail
@@ -65,6 +111,7 @@ async function fetchSummary() {
     if (!state.activeDataset || state.activeDataset === "None") {
       state.activeDataset = "active_invoices.csv";
     }
+    localStorage.setItem(ACTIVE_DATASET_KEY, state.activeDataset);
     document.getElementById("activeDataset").textContent = state.activeDataset;
     document.getElementById("kpiTotalDue").textContent = currency(data.total_due);
     document.getElementById("kpiTotalInvoices").textContent = data.total_invoices;
@@ -75,10 +122,12 @@ async function fetchSummary() {
   } catch (err) {
     state.hasActiveDataset = false;
     state.summary = null;
-    state.activeDataset = "None";
-    document.getElementById("activeDataset").textContent = "None";
+    document.getElementById("activeDataset").textContent = state.activeDataset || "None";
     clearKpiPlaceholders();
-    document.getElementById("dataStatusText").textContent = String(err);
+    document.getElementById("dataStatusText").textContent =
+      `Could not refresh server data right now (${String(err)}). Last known dataset: ${state.activeDataset || "None"}.`;
+  } finally {
+    setDashboardLoading(false);
   }
 }
 
@@ -87,19 +136,17 @@ async function fetchInvoices(limit = 200) {
     state.records = [];
     renderRecentTable([]);
     renderPreviewTable([]);
-    renderRegionChart([]);
-    renderStatusChart([]);
+    renderDashboardCharts([]);
     return;
   }
   try {
-    const res = await fetch(`${apiBase}/invoices?limit=${limit}`, { cache: "no-store" });
-    const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
+    setDashboardLoading(true);
+    const { ok, data } = await apiFetch(`/invoices?limit=${limit}`, { cache: "no-store" });
+    if (!ok) {
       state.records = [];
       renderRecentTable([]);
       renderPreviewTable([]);
-      renderRegionChart([]);
-      renderStatusChart([]);
+      renderDashboardCharts([]);
       document.getElementById("dataStatusText").textContent =
         typeof data.detail === "string" ? data.detail : "Failed to load invoice rows.";
       return;
@@ -107,55 +154,106 @@ async function fetchInvoices(limit = 200) {
     state.records = data.records || [];
     renderRecentTable(state.records);
     renderPreviewTable(state.records.slice(0, 10));
-    renderRegionChart(state.records);
-    renderStatusChart(state.records);
+    renderDashboardCharts(state.records);
   } catch (err) {
     state.records = [];
     renderRecentTable([]);
     renderPreviewTable([]);
-    renderRegionChart([]);
-    renderStatusChart([]);
+    renderDashboardCharts([]);
     document.getElementById("dataStatusText").textContent = String(err);
+  } finally {
+    setDashboardLoading(false);
   }
 }
 
-function renderRegionChart(records) {
-  const container = document.getElementById("regionChart");
-  const map = {};
-  records.forEach((row) => {
-    const key = row.region || "Unknown";
-    map[key] = (map[key] || 0) + Number(row.invoice_amount_due || 0);
-  });
-  const entries = Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, 6);
-  const max = entries.length ? entries[0][1] : 1;
-  container.innerHTML = "";
-  entries.forEach(([region, value]) => {
-    const percent = Math.round((value / max) * 100);
-    const row = document.createElement("div");
-    row.className = "chart-row";
-    row.innerHTML = `
-      <span>${region}</span>
-      <div class="bar-track"><div class="bar-fill" style="width:${percent}%"></div></div>
-      <strong>${currency(value)}</strong>
-    `;
-    container.appendChild(row);
-  });
+function destroyChart(chart) {
+  if (chart && typeof chart.destroy === "function") chart.destroy();
 }
 
-function renderStatusChart(records) {
-  const container = document.getElementById("statusChart");
-  const counts = { paid: 0, pending: 0, overdue: 0 };
+function renderDashboardCharts(records) {
+  const hasChartLib = typeof Chart !== "undefined";
+  if (!hasChartLib) return;
+
+  const outstandingMap = {};
+  const riskMap = {};
+  const agingMap = {};
+  const statusCounts = { paid: 0, pending: 0, overdue: 0 };
+  let totalOutstanding = 0;
+  let overdueCount = 0;
+
   records.forEach((row) => {
-    const k = String(row.status || "").toLowerCase();
-    if (k in counts) counts[k] += 1;
-    else counts.overdue += 1;
+    const amount = Number(row.invoice_amount_due || 0);
+    const region = row.region || "Unknown";
+    const status = String(row.status || "").toLowerCase();
+    const aging = row.aging_bucket || "Unknown";
+    const risk = Number(row.risk_score || 0);
+
+    outstandingMap[region] = (outstandingMap[region] || 0) + amount;
+    riskMap[region] = riskMap[region] || { totalRisk: 0, count: 0 };
+    riskMap[region].totalRisk += risk;
+    riskMap[region].count += 1;
+    agingMap[aging] = (agingMap[aging] || 0) + amount;
+    totalOutstanding += amount;
+
+    if (status in statusCounts) statusCounts[status] += 1;
+    else statusCounts.overdue += 1;
+    if (status === "overdue") overdueCount += 1;
   });
-  container.innerHTML = "";
-  Object.entries(counts).forEach(([status, count]) => {
-    const div = document.createElement("div");
-    div.className = "pie-item";
-    div.innerHTML = `<span>${status.toUpperCase()}</span><strong>${count}</strong>`;
-    container.appendChild(div);
+
+  const overduePct = records.length ? (overdueCount / records.length) * 100 : 0;
+
+  const outstandingEntries = Object.entries(outstandingMap)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8);
+  const riskEntries = Object.entries(riskMap)
+    .map(([region, stat]) => [region, stat.count ? stat.totalRisk / stat.count : 0])
+    .sort((a, b) => b[1] - a[1]);
+  const agingEntries = Object.entries(agingMap).sort((a, b) => b[1] - a[1]);
+
+  const outstandingCtx = document.getElementById("outstandingChart");
+  const overdueCtx = document.getElementById("overdueChart");
+  const riskCtx = document.getElementById("riskRegionChart");
+  const agingCtx = document.getElementById("agingBucketChart");
+  if (!outstandingCtx || !overdueCtx || !riskCtx || !agingCtx) return;
+
+  destroyChart(state.charts.outstanding);
+  state.charts.outstanding = new Chart(outstandingCtx, {
+    type: "bar",
+    data: {
+      labels: outstandingEntries.map(([label]) => label),
+      datasets: [{ label: "Outstanding", data: outstandingEntries.map(([, v]) => Number(v.toFixed(2))), backgroundColor: "#3b82f6", borderRadius: 8 }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
+  });
+
+  destroyChart(state.charts.overdue);
+  state.charts.overdue = new Chart(overdueCtx, {
+    type: "doughnut",
+    data: {
+      labels: ["Overdue", "Non-Overdue"],
+      datasets: [{ data: [Number(overduePct.toFixed(2)), Number((100 - overduePct).toFixed(2))], backgroundColor: ["#ef4444", "#93c5fd"] }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.label}: ${ctx.raw}%` } } } },
+  });
+
+  destroyChart(state.charts.riskByRegion);
+  state.charts.riskByRegion = new Chart(riskCtx, {
+    type: "radar",
+    data: {
+      labels: riskEntries.map(([label]) => label),
+      datasets: [{ label: "Avg Risk Score", data: riskEntries.map(([, v]) => Number(v.toFixed(1))), borderColor: "#1d4ed8", backgroundColor: "rgba(37, 99, 235, 0.25)" }],
+    },
+    options: { responsive: true, maintainAspectRatio: false, scales: { r: { suggestedMin: 0, suggestedMax: 100 } } },
+  });
+
+  destroyChart(state.charts.agingBucket);
+  state.charts.agingBucket = new Chart(agingCtx, {
+    type: "line",
+    data: {
+      labels: agingEntries.map(([label]) => label),
+      datasets: [{ label: "Amount Due", data: agingEntries.map(([, v]) => Number(v.toFixed(2))), borderColor: "#0ea5e9", backgroundColor: "rgba(14,165,233,0.2)", fill: true, tension: 0.3 }],
+    },
+    options: { responsive: true, maintainAspectRatio: false },
   });
 }
 
@@ -529,6 +627,61 @@ function sanitizeSummaryText(text) {
   return out.trim();
 }
 
+function parseMarkdownTable(text) {
+  const lines = String(text || "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const tableStart = lines.findIndex((line, idx) => line.includes("|") && idx + 1 < lines.length && /^\|?\s*[-:| ]+\|?\s*$/.test(lines[idx + 1]));
+  if (tableStart < 0) return null;
+
+  const rowLines = [];
+  for (let i = tableStart; i < lines.length; i += 1) {
+    if (!lines[i].includes("|")) break;
+    rowLines.push(lines[i]);
+  }
+  if (rowLines.length < 2) return null;
+
+  const parseRow = (row) =>
+    row
+      .replace(/^\||\|$/g, "")
+      .split("|")
+      .map((cell) => cell.trim());
+
+  const headers = parseRow(rowLines[0]);
+  const dataRows = rowLines.slice(2).map(parseRow).filter((cells) => cells.length === headers.length);
+  if (!headers.length || !dataRows.length) return null;
+  return { headers, rows: dataRows };
+}
+
+function renderMarkdownTable(tableData) {
+  const wrap = document.createElement("div");
+  wrap.className = "table-wrap copilot-inline-table";
+  wrap.style.maxHeight = "220px";
+  const table = document.createElement("table");
+  const thead = document.createElement("thead");
+  const tbody = document.createElement("tbody");
+  const hr = document.createElement("tr");
+  tableData.headers.forEach((h) => {
+    const th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  tableData.rows.forEach((r) => {
+    const tr = document.createElement("tr");
+    r.forEach((value) => {
+      const td = document.createElement("td");
+      td.textContent = value;
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.append(thead, tbody);
+  wrap.appendChild(table);
+  return wrap;
+}
+
 function appendStructuredCopilotMessage(data) {
   const chat = document.getElementById("chatHistory");
   const style = data.response_style || "direct";
@@ -545,8 +698,18 @@ function appendStructuredCopilotMessage(data) {
     avatar.textContent = "✦";
     const div = document.createElement("div");
     div.className = "chat-bubble bot";
-    div.textContent = data.summary || "—";
-    row.append(avatar, div);
+    const summaryText = data.summary || "—";
+    const mdTable = parseMarkdownTable(summaryText);
+    if (mdTable) {
+      div.textContent = summaryText.split("\n").find((line) => !line.includes("|")) || "Here is the requested table:";
+      const stack = document.createElement("div");
+      stack.appendChild(div);
+      stack.appendChild(renderMarkdownTable(mdTable));
+      row.append(avatar, stack);
+    } else {
+      div.textContent = summaryText;
+      row.append(avatar, div);
+    }
     chat.appendChild(row);
     chat.scrollTop = chat.scrollHeight;
     return;
@@ -701,14 +864,13 @@ async function askQuestion(question) {
   appendChatBubble("user", question);
   const typing = showTypingIndicator();
   try {
-    const res = await fetch(`${apiBase}/ask`, {
+    const { ok, data } = await apiFetch("/ask", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question, session_id: state.sessionId || null }),
     });
-    const data = await res.json();
     typing.remove();
-    if (!res.ok) throw new Error(data.detail || "Ask failed");
+    if (!ok) throw new Error(data.detail || "Ask failed");
     if (data.session_id) {
       state.sessionId = data.session_id;
       sessionStorage.setItem("copilotSessionId", state.sessionId);
@@ -729,12 +891,12 @@ async function uploadCsv() {
   }
   const form = new FormData();
   form.append("file", fileInput.files[0]);
-  const res = await fetch(`${apiBase}/upload-csv`, { method: "POST", body: form });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || "Upload failed");
+  const { ok, data } = await apiFetch("/upload-csv", { method: "POST", body: form });
+  if (!ok) throw new Error(data.detail || "Upload failed");
   state.sessionId = "";
   sessionStorage.removeItem("copilotSessionId");
   state.activeDataset = data.file || "active_invoices.csv";
+  localStorage.setItem(ACTIVE_DATASET_KEY, state.activeDataset);
   document.getElementById("activeDataset").textContent = state.activeDataset;
   const uploaded = data.rows != null ? ` Saved ${data.rows} rows.` : "";
   document.getElementById("uploadMsg").textContent = (data.message || "Upload successful.") + uploaded;

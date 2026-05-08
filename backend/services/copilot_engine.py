@@ -22,6 +22,10 @@ def _currency(v: float) -> str:
 
 def _to_records(frame: pd.DataFrame, limit: int = 100) -> List[Dict[str, Any]]:
     selected = frame.head(limit).copy()
+    for col in selected.columns:
+        if pd.api.types.is_datetime64_any_dtype(selected[col]) or pd.api.types.is_timedelta64_dtype(selected[col]):
+            selected[col] = selected[col].astype(str)
+    selected = selected.where(pd.notna(selected), None)
     if "due_date" in selected.columns:
         selected["due_date"] = selected["due_date"].astype(str)
     return selected.to_dict(orient="records")
@@ -41,8 +45,9 @@ def _extract_amount(text: str) -> Optional[float]:
 
 
 CLARIFY_MESSAGE = (
-    "I can answer questions about customer_name, invoice_id, invoice amounts (balances), due_date, "
-    "payment_date (optional, for paid-in-period questions), status, region, risk_score, and aging_bucket. "
+    "I can answer questions about customer_name, invoice_id, amount_due/balance_remaining, amount_paid, "
+    "invoice_date, due_date, payment_date, status, region, risk_score, aging_bucket, payment_method, "
+    "collection_priority, customer_segment, assigned_collector, and invoice_category. "
     "Could you rephrase your question?"
 )
 
@@ -50,6 +55,7 @@ _FINANCE_TOPIC_PATTERN = re.compile(
     r"invoice|invoices|customer|customers|region|regions|due|amount|balance|overdue|"
     r"risk|aging|ageing|\bar\b|outstanding|total|average|avg|mean|count|how many|which|what|show|list|"
     r"display|table|paid|pending|status|summarize|overview|portfolio|collection|"
+    r"collector|segment|category|payment method|priority|invoice date|payment date|"
     r"high risk|per region|by region",
     re.I,
 )
@@ -62,6 +68,18 @@ def _question_covers_finance(q: str) -> bool:
     if len(q) < 2:
         return False
     return bool(_FINANCE_TOPIC_PATTERN.search(q))
+
+
+def _is_followup_question(question: str) -> bool:
+    q = question.strip().lower()
+    if len(q) <= 3:
+        return True
+    return bool(
+        re.search(
+            r"^(and|also|what about|how about|about those|about them|for those|for them|same|same for|now|then)\b",
+            q,
+        )
+    )
 
 
 def _user_wants_tabular_invoice_list(q: str) -> bool:
@@ -82,6 +100,7 @@ def _user_wants_tabular_invoice_list(q: str) -> bool:
             "every invoice",
             "all invoices",
             "all the invoices",
+            "top ",
         )
     ):
         return True
@@ -339,6 +358,54 @@ def _wants_recommendation(q: str) -> bool:
     )
 
 
+def _relevant_columns_for_question(frame: pd.DataFrame, question: str) -> List[str]:
+    q = question.lower()
+    preferred: List[str] = []
+    if "customer" in q and "customer_name" in frame.columns:
+        preferred.append("customer_name")
+    if ("invoice" in q or "id" in q) and "invoice_id" in frame.columns:
+        preferred.append("invoice_id")
+    if any(t in q for t in ("amount", "balance", "due", "outstanding")) and "invoice_amount_due" in frame.columns:
+        preferred.append("invoice_amount_due")
+    if "amount paid" in q and "amount_paid" in frame.columns:
+        preferred.append("amount_paid")
+    if "balance remaining" in q and "balance_remaining" in frame.columns:
+        preferred.append("balance_remaining")
+    if "invoice date" in q and "invoice_date" in frame.columns:
+        preferred.append("invoice_date")
+    if any(t in q for t in ("due date", "due this week", "when due", "this week")) and "due_date" in frame.columns:
+        preferred.append("due_date")
+    if "payment date" in q and "payment_date" in frame.columns:
+        preferred.append("payment_date")
+    if "status" in q and "status" in frame.columns:
+        preferred.append("status")
+    if "region" in q and "region" in frame.columns:
+        preferred.append("region")
+    if "risk" in q and "risk_score" in frame.columns:
+        preferred.append("risk_score")
+    if "aging" in q and "aging_bucket" in frame.columns:
+        preferred.append("aging_bucket")
+    if "payment method" in q and "payment_method" in frame.columns:
+        preferred.append("payment_method")
+    if "priority" in q and "collection_priority" in frame.columns:
+        preferred.append("collection_priority")
+    if "segment" in q and "customer_segment" in frame.columns:
+        preferred.append("customer_segment")
+    if ("collector" in q or "assigned" in q) and "assigned_collector" in frame.columns:
+        preferred.append("assigned_collector")
+    if "category" in q and "invoice_category" in frame.columns:
+        preferred.append("invoice_category")
+    base_defaults = [c for c in ("customer_name", "invoice_id", "invoice_amount_due", "due_date", "status") if c in frame.columns]
+    cols = preferred or base_defaults
+    seen = set()
+    out: List[str] = []
+    for c in cols:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
 def _regions_from_question(q: str, regions: List[str]) -> List[str]:
     q_low = q.lower()
     matched: List[str] = []
@@ -461,6 +528,91 @@ class CopilotEngine:
         self, frame: pd.DataFrame, question: str, memory: ConversationState
     ) -> Optional[Dict[str, Any]]:
         qlow = question.lower().strip()
+        want_table = _user_wants_tabular_invoice_list(qlow)
+
+        if (
+            re.search(r"\bwhich\s+region\b", qlow)
+            and re.search(r"\b(highest|most|largest|top)\b", qlow)
+            and re.search(r"\b(balance|outstanding|due|ar|amount)\b", qlow)
+            and {"region", "invoice_amount_due"}.issubset(frame.columns)
+        ):
+            g = (
+                frame.groupby("region", as_index=False)["invoice_amount_due"]
+                .sum()
+                .rename(columns={"invoice_amount_due": "total_due"})
+                .sort_values("total_due", ascending=False)
+            )
+            if g.empty:
+                return self._payload_direct("No regional balances were found.", "highest_region_balance", "LOOKUP")
+            top = g.iloc[0]
+            if not want_table:
+                return self._payload_direct(
+                    f"{top['region']} has the highest outstanding balance at {_currency(float(top['total_due']))}.",
+                    "highest_region_balance",
+                    "LOOKUP",
+                )
+            return {
+                "summary": f"{top['region']} has the highest outstanding balance at {_currency(float(top['total_due']))}.",
+                "key_findings": [],
+                "recommended_action": "",
+                "matching_records": _to_records(g, limit=100),
+                "intent": "highest_region_balance",
+                "response_type": "AGGREGATION",
+                "response_style": "records",
+            }
+
+        if ("due this week" in qlow or "due in this week" in qlow or "this week's due" in qlow) and "due_date" in frame.columns:
+            start = pd.Timestamp.utcnow().normalize()
+            end = start + pd.Timedelta(days=7)
+            due = frame[(frame["due_date"].notna()) & (frame["due_date"] >= start) & (frame["due_date"] < end)]
+            due = due.sort_values("due_date", ascending=True)
+            total = float(pd.to_numeric(due.get("invoice_amount_due"), errors="coerce").fillna(0).sum()) if "invoice_amount_due" in due.columns else 0.0
+            cols = _relevant_columns_for_question(due, question)
+            due_show = due[cols] if cols else due
+            if not want_table:
+                return self._payload_direct(
+                    f"{len(due)} invoices are due this week totaling {_currency(total)}.",
+                    "due_this_week",
+                    "AGGREGATION",
+                )
+            return {
+                "summary": f"{len(due)} invoices are due this week totaling {_currency(total)}.",
+                "key_findings": [],
+                "recommended_action": "",
+                "matching_records": _to_records(due_show, limit=100),
+                "intent": "due_this_week",
+                "response_type": "FILTERED_RECORDS",
+                "response_style": "records",
+            }
+
+        if any(x in qlow for x in ("highest risk customer", "customer has highest risk", "which customer has highest risk")):
+            if "risk_score" in frame.columns and "customer_name" in frame.columns:
+                work = frame.copy()
+                work["risk_score"] = pd.to_numeric(work["risk_score"], errors="coerce").fillna(0)
+                idx = int(work["risk_score"].idxmax()) if not work.empty else -1
+                if idx >= 0:
+                    row = work.loc[idx]
+                    due_amt = float(pd.to_numeric(row.get("invoice_amount_due"), errors="coerce") or 0.0)
+                    return self._payload_direct(
+                        f"{row.get('customer_name', 'Unknown')} has the highest risk score ({float(row['risk_score']):.1f}) with invoice exposure {_currency(due_amt)}.",
+                        "highest_risk_customer",
+                        "LOOKUP",
+                    )
+
+        if "overdue exposure" in qlow:
+            if {"due_date", "status", "invoice_amount_due"}.issubset(frame.columns):
+                today = pd.Timestamp.utcnow().date()
+                overdue = frame[
+                    frame["due_date"].notna()
+                    & (pd.to_datetime(frame["due_date"], errors="coerce").dt.date < today)
+                    & (frame["status"].astype(str).str.lower().str.strip() != "paid")
+                ]
+                total = float(pd.to_numeric(overdue["invoice_amount_due"], errors="coerce").fillna(0).sum())
+                return self._payload_direct(
+                    f"Overdue exposure is {_currency(total)} across {len(overdue)} invoices.",
+                    "overdue_exposure",
+                    "AGGREGATION",
+                )
 
         if _is_region_catalog_question(qlow):
             return self._count_regions(frame, {}, question)
@@ -859,7 +1011,7 @@ Sample rows: {json.dumps(sample, default=str)}
                 "same ones",
                 "same customers",
             )
-        )
+        ) or (_is_followup_question(question) and bool(memory.last_records))
         amount = _extract_amount(q)
 
         region_guess = [r for r in _regions_from_question(q, regions)]
@@ -883,42 +1035,26 @@ Sample rows: {json.dumps(sample, default=str)}
             limit = 10
 
         analysis = "records"
-
-        if any(
-            phrase in q
-            for phrase in (
-                "financial overview",
-                "summarize the dataset",
-                "summarize dataset",
-                "dataset summary",
-                "portfolio overview",
-                "ar risk overview",
-                "give me ar risk",
-                "overall picture",
-            )
-        ):
+        if re.search(r"\b(overview|summary|summarize|overall picture|portfolio)\b", q):
             analysis = "overview"
-        elif "how many customers" in q or "number of customers" in q or "customer count" in q:
+        elif re.search(r"\b(how many|count|number of)\s+customers?\b", q):
             analysis = "count_customers"
         elif _is_region_catalog_question(q):
             analysis = "count_regions"
-        elif "average" in q or "avg" in q or "mean " in q:
-            if "invoice" in q or "amount" in q or "balance" in q or "due" in q:
-                analysis = "avg_amount"
-        elif "collection priority" in q or "contact first" in q or "collections contact" in q:
+        elif re.search(r"\b(average|avg|mean)\b", q) and re.search(r"\b(invoice|amount|balance|due)\b", q):
+            analysis = "avg_amount"
+        elif re.search(r"\b(collection|priority|contact first|who to call)\b", q):
             analysis = "collection_priority"
-        elif ("aging" in q or "ageing" in q) and ("risk" in q or "highest" in q):
+        elif re.search(r"\b(aging|ageing)\b", q) and re.search(r"\b(risk|highest|worst)\b", q):
             analysis = "aging_bucket_risk"
-        elif (
-            ("by region" in q or "per region" in q)
-            and ("risk" in q or "ar" in q or "summarize" in q or "breakdown" in q)
-        ) or (
-            "which region" in q
-            and ("highest" in q or "most" in q or "largest" in q)
-            and ("balance" in q or "outstanding" in q or "ar" in q or "due" in q)
+        elif (re.search(r"\b(by|per)\s+region\b", q) and re.search(r"\b(risk|ar|breakdown|summarize|balance|outstanding)\b", q)) or (
+            re.search(r"\bwhich\s+region\b", q) and re.search(r"\b(highest|most|largest|top)\b", q)
         ):
             analysis = "region_ar_summary"
-        elif ("top" in q and "customer" in q) or "show all customers" in q or "list customers" in q or "customer list" in q:
+        elif (re.search(r"\btop\s+\d*\s*customers?\b", q) is not None) or re.search(
+            r"\b(show|list)\s+(all\s+)?customers?\b",
+            q,
+        ):
             analysis = "top_customers"
             if limit is None and ("all customers" in q or "every customer" in q):
                 limit = 500
@@ -1016,7 +1152,12 @@ Sample rows: {json.dumps(sample, default=str)}
         sorted_limited = self._apply_sort_limit(filtered, plan)
         summary = self._direct_records_summary(question, sorted_limited)
         want_table = _user_wants_tabular_invoice_list(qlow)
-        recs: List[Dict[str, Any]] = _to_records(sorted_limited, limit=100) if want_table else []
+        if want_table:
+            cols = _relevant_columns_for_question(sorted_limited, question)
+            slim = sorted_limited[cols] if cols else sorted_limited
+            recs: List[Dict[str, Any]] = _to_records(slim, limit=100)
+        else:
+            recs = []
         return {
             "summary": summary,
             "key_findings": [],
@@ -1170,15 +1311,20 @@ Sample rows: {json.dumps(sample, default=str)}
         else:
             top_amt = float(pd.to_numeric(show.iloc[0]["invoice_amount_due"], errors="coerce") or 0.0)
             summary = f"First in queue: {show.iloc[0]['customer_name']} ({_currency(top_amt)}); {len(show)} accounts listed."
+        want_table = _user_wants_tabular_invoice_list(question.lower())
+        cols = _relevant_columns_for_question(show, question)
+        show_out = show[cols] if (want_table and cols) else show
         out = show.drop(columns=["_priority_score"], errors="ignore")
         return {
             "summary": summary,
             "key_findings": [],
             "recommended_action": "",
-            "matching_records": _to_records(out, limit=100),
+            "matching_records": _to_records(show_out.drop(columns=["_priority_score"], errors="ignore"), limit=100)
+            if want_table
+            else [],
             "intent": "collection_priority",
-            "response_type": "FILTERED_RECORDS",
-            "response_style": "records",
+            "response_type": "FILTERED_RECORDS" if want_table else "SUMMARY",
+            "response_style": "records" if want_table else "direct",
         }
 
     def _top_customers(self, filtered: pd.DataFrame, plan: Dict[str, Any], question: str) -> Dict[str, Any]:
@@ -1210,15 +1356,22 @@ Sample rows: {json.dumps(sample, default=str)}
                 f"{r['customer_name']} {_currency(float(r['total_balance_due']))}"
                 for _, r in show.iterrows()
             ]
-            summary = "; ".join(parts)
+            summary = "; ".join(parts[:5]) if len(parts) > 5 else "; ".join(parts)
+        want_table = _user_wants_tabular_invoice_list(question.lower())
         return {
             "summary": summary,
             "key_findings": [],
             "recommended_action": "",
-            "matching_records": _to_records(show, limit=100),
+            "matching_records": _to_records(show, limit=100) if want_table else [],
             "intent": "top_customers",
-            "response_type": "FILTERED_RECORDS",
-            "response_style": "records",
+            "response_type": "FILTERED_RECORDS" if want_table else "AGGREGATION",
+            "response_style": "records" if want_table else "direct",
+            "chart_data": {
+                "kind": "bar",
+                "title": "Top Customers by Balance",
+                "labels": [str(x) for x in show["customer_name"].tolist()],
+                "values": [float(x) for x in show["total_balance_due"].tolist()],
+            },
         }
 
     def _aging_bucket_risk(self, filtered: pd.DataFrame, plan: Dict[str, Any], question: str) -> Dict[str, Any]:
@@ -1236,14 +1389,21 @@ Sample rows: {json.dumps(sample, default=str)}
         summary = (
             f"Highest average risk: '{top['aging_bucket']}' (score {float(top['avg_risk_score']):.1f})."
         )
+        want_table = _user_wants_tabular_invoice_list(question.lower())
         return {
             "summary": summary,
             "key_findings": [],
             "recommended_action": "",
-            "matching_records": _to_records(g, limit=100),
+            "matching_records": _to_records(g, limit=100) if want_table else [],
             "intent": "aging_bucket_risk",
             "response_type": "AGGREGATION",
-            "response_style": "records",
+            "response_style": "records" if want_table else "direct",
+            "chart_data": {
+                "kind": "bar",
+                "title": "Average Risk by Aging Bucket",
+                "labels": [str(x) for x in g["aging_bucket"].tolist()],
+                "values": [float(x) for x in g["avg_risk_score"].tolist()],
+            },
         }
 
     def _region_ar_summary(self, filtered: pd.DataFrame, plan: Dict[str, Any], question: str) -> Dict[str, Any]:
@@ -1278,14 +1438,21 @@ Sample rows: {json.dumps(sample, default=str)}
                 f"Largest AR is {top['region']} at {_currency(float(top['total_ar']))} "
                 f"({int(top['invoice_count'])} invoices, avg risk {float(top['avg_risk']):.1f})."
             )
+        want_table = _user_wants_tabular_invoice_list(question.lower())
         return {
             "summary": summary,
             "key_findings": [],
             "recommended_action": "",
-            "matching_records": _to_records(g, limit=100),
+            "matching_records": _to_records(g, limit=100) if want_table else [],
             "intent": "region_ar_summary",
             "response_type": "AGGREGATION",
-            "response_style": "records",
+            "response_style": "records" if want_table else "direct",
+            "chart_data": {
+                "kind": "bar",
+                "title": "AR by Region",
+                "labels": [str(x) for x in g["region"].tolist()],
+                "values": [float(x) for x in g["total_ar"].tolist()],
+            },
         }
 
     def _sanitize_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:

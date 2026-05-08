@@ -28,6 +28,7 @@ ALIASES = {
         "outstanding_amount",
         "amount",
         "balance",
+        "balance_remaining",
         "total_due",
         "open_balance",
         "ar_balance",
@@ -39,10 +40,16 @@ ALIASES = {
         "payment_received_amount",
     },
     "due_date": {"due_date", "duedate", "payment_due_date", "invoice_due_date"},
+    "invoice_date": {"invoice_date", "invoicedate", "bill_date", "issued_date"},
     "status": {"status", "invoice_status"},
     "region": {"region", "sales_region", "customer_region"},
     "risk_score": {"risk_score", "riskscore", "risk"},
     "aging_bucket": {"aging_bucket", "aging", "ageing", "ageing_bucket"},
+    "payment_method": {"payment_method", "paymentmode", "payment_type", "paid_via"},
+    "collection_priority": {"collection_priority", "priority", "collection_tier"},
+    "customer_segment": {"customer_segment", "segment", "customer_tier"},
+    "assigned_collector": {"assigned_collector", "collector", "owner", "assigned_to"},
+    "invoice_category": {"invoice_category", "category", "invoice_type"},
 }
 
 
@@ -115,6 +122,8 @@ def prepare_invoice_frame(frame: pd.DataFrame) -> pd.DataFrame:
             break
     if "payment_date" in frame.columns:
         frame["payment_date"] = pd.to_datetime(frame["payment_date"], errors="coerce")
+    if "invoice_date" in frame.columns:
+        frame["invoice_date"] = pd.to_datetime(frame["invoice_date"], errors="coerce")
     return frame
 
 

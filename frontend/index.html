@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Enterprise Financial AI Copilot</title>
     <link rel="stylesheet" href="./style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   </head>
   <body>
     <section id="loginPage" class="login-page">
@@ -18,12 +19,6 @@
         <input id="loginPassword" type="password" placeholder="Password" />
         <button id="loginBtn" class="primary-btn">Login</button>
         <p id="loginError" class="error-text"></p>
-        <div class="demo-credentials">
-          <strong>Demo credentials</strong>
-          <span>admin@financecopilot.com / Admin@123</span>
-          <span class="muted">Frontend validation only</span>
-          <span class="muted">No backend auth required</span>
-        </div>
       </div>
     </section>
 
@@ -86,14 +81,30 @@
             </div>
           </div>
 
-          <div class="charts-grid">
+          <div class="charts-grid charts-grid-2x2">
             <div class="panel">
-              <h3>Outstanding Balance by Region</h3>
-              <div id="regionChart" class="chart-area"></div>
+              <h3>Total Outstanding Balance</h3>
+              <div class="chart-area">
+                <canvas id="outstandingChart"></canvas>
+              </div>
             </div>
             <div class="panel">
-              <h3>Invoice Status Distribution</h3>
-              <div id="statusChart" class="chart-area"></div>
+              <h3>Overdue Percentage</h3>
+              <div class="chart-area">
+                <canvas id="overdueChart"></canvas>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Risk by Region</h3>
+              <div class="chart-area">
+                <canvas id="riskRegionChart"></canvas>
+              </div>
+            </div>
+            <div class="panel">
+              <h3>Aging Bucket Analysis</h3>
+              <div class="chart-area">
+                <canvas id="agingBucketChart"></canvas>
+              </div>
             </div>
           </div>
 

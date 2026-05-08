@@ -12,7 +12,14 @@ def _currency(value: float) -> str:
 
 def _records(frame: pd.DataFrame, limit: int = 100) -> List[Dict[str, Any]]:
     selected = frame.head(limit).copy()
-    selected["due_date"] = selected["due_date"].astype(str)
+    # Normalize API payload types so FastAPI JSON serialization never fails
+    # when CSV contains datetime-like columns (e.g., payment_date) or NaN/NaT.
+    for col in selected.columns:
+        if pd.api.types.is_datetime64_any_dtype(selected[col]) or pd.api.types.is_timedelta64_dtype(selected[col]):
+            selected[col] = selected[col].astype(str)
+    selected = selected.where(pd.notna(selected), None)
+    if "due_date" in selected.columns:
+        selected["due_date"] = selected["due_date"].astype(str)
     return selected.to_dict(orient="records")
 
 
