@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Enterprise Financial AI Copilot</title>
     <link rel="stylesheet" href="./style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
       .team-shell {
         max-width: 1280px;
@@ -41,10 +42,20 @@
             <input id="questionInput" type="text" placeholder="Ask anything about invoices, risk, regions, or collections…" autocomplete="off" />
             <button id="askBtn" class="copilot-send-btn" type="button">Ask Copilot</button>
           </div>
+          <div class="copilot-meta-row-bottom">
+            <div id="copilotLatencyMeta" class="copilot-latency-meta muted">Last response: —</div>
+            <span id="copilotConnectionBadge" class="copilot-connection-badge status-ok">API Connected</span>
+          </div>
         </div>
       </div>
     </div>
+    <div id="toastRoot" class="toast-root" aria-live="polite" aria-atomic="true"></div>
 
+    <script src="./shared-api.js"></script>
+    <script src="./shared-chat.js"></script>
+    <script src="./shared-renderers.js"></script>
+    <script src="./shared-text.js"></script>
+    <script src="./shared-ui.js"></script>
     <script>
       const API_BASE_CANDIDATES = Array.from(
         new Set(
@@ -56,142 +67,38 @@
       const state = {
         sessionId: sessionStorage.getItem("teamCopilotSessionId") || "",
         apiBase: API_BASE_CANDIDATES[0],
+        lastQuestion: "",
       };
 
       async function apiFetch(path, options = {}) {
-        let lastErr = null;
-        for (const base of API_BASE_CANDIDATES) {
-          try {
-            const res = await fetch(`${base}${path}`, options);
-            const raw = await res.text();
-            let data = {};
-            try {
-              data = raw ? JSON.parse(raw) : {};
-            } catch (_err) {
-              data = { detail: raw.slice(0, 180) };
-            }
-            const looksLikeHtml = /^\s*</.test(raw || "");
-            if (looksLikeHtml && !res.headers.get("content-type")?.includes("application/json")) {
-              lastErr = new Error(`Non-JSON response from ${base}${path}`);
-              continue;
-            }
-            state.apiBase = base;
-            return { ok: res.ok, status: res.status, data };
-          } catch (err) {
-            lastErr = err;
-          }
-        }
-        throw lastErr || new Error("Could not connect to backend API.");
-      }
-
-      function appendChatBubble(role, text) {
-        const chat = document.getElementById("chatHistory");
-        const row = document.createElement("div");
-        row.className = `chat-message-row ${role}`;
-        if (role === "bot") {
-          const avatar = document.createElement("span");
-          avatar.className = "copilot-avatar small";
-          avatar.textContent = "✦";
-          const div = document.createElement("div");
-          div.className = `chat-bubble ${role}`;
-          div.textContent = text;
-          row.append(avatar, div);
-        } else {
-          const div = document.createElement("div");
-          div.className = `chat-bubble ${role}`;
-          div.textContent = text;
-          row.appendChild(div);
-        }
-        chat.appendChild(row);
-        chat.scrollTop = chat.scrollHeight;
-        return row;
-      }
-
-      function showTypingIndicator() {
-        const chat = document.getElementById("chatHistory");
-        const row = document.createElement("div");
-        row.className = "copilot-typing-row";
-        const avatar = document.createElement("span");
-        avatar.className = "copilot-avatar";
-        avatar.textContent = "✦";
-        const dots = document.createElement("div");
-        dots.className = "typing-dots";
-        for (let i = 0; i < 3; i += 1) dots.appendChild(document.createElement("span"));
-        row.append(avatar, dots);
-        chat.appendChild(row);
-        chat.scrollTop = chat.scrollHeight;
-        return row;
-      }
-
-      function buildInlineRecordsTable(records, maxHeightPx) {
-        const wrap = document.createElement("div");
-        wrap.className = "table-wrap copilot-inline-table";
-        if (maxHeightPx) wrap.style.maxHeight = `${maxHeightPx}px`;
-        const table = document.createElement("table");
-        const thead = document.createElement("thead");
-        const tbody = document.createElement("tbody");
-        if (!records || records.length === 0) {
-          const tr = document.createElement("tr");
-          const td = document.createElement("td");
-          td.textContent = "No matching rows for this answer.";
-          tr.appendChild(td);
-          tbody.appendChild(tr);
-          table.append(thead, tbody);
-          wrap.appendChild(table);
-          return wrap;
-        }
-        const columns = Object.keys(records[0]);
-        const hr = document.createElement("tr");
-        columns.forEach((c) => {
-          const th = document.createElement("th");
-          th.textContent = c;
-          hr.appendChild(th);
+        return window.CopilotApi.fetchWithFallback(path, options, API_BASE_CANDIDATES, (base) => {
+          state.apiBase = base;
         });
-        thead.appendChild(hr);
-        records.forEach((row) => {
-          const tr = document.createElement("tr");
-          columns.forEach((c) => {
-            const td = document.createElement("td");
-            td.textContent = row[c] ?? "";
-            tr.appendChild(td);
-          });
-          tbody.appendChild(tr);
-        });
-        table.append(thead, tbody);
-        wrap.appendChild(table);
-        return wrap;
-      }
-
-      function sanitizeSummaryText(text) {
-        const t = String(text || "").trim();
-        if (!t) return t;
-        // JS does not support inline modifiers like (?is). Use [\s\S]*? to mimic dotall.
-        let out = t;
-        out = out.replace(
-          /^\s*(enterprise financial ai copilot|our copilot)\s+(found|identified|located)\s+[\s\S]*?(?:\.\s*)?$/i,
-          ""
-        );
-        out = out.replace(/found\s+\d+\s+matching\s+records\b[\s\S]*?(?:\.\s*)?$/i, "");
-        out = out.replace(/\bmatching\s+records\b/i, "");
-        return out.trim();
       }
 
       function appendStructuredCopilotMessage(data) {
         const chat = document.getElementById("chatHistory");
+        window.CopilotChat?.clearEmptyState("chatHistory");
         const style = data.response_style || "direct";
         const records = data.matching_records || [];
-        if (typeof data.summary === "string") data.summary = sanitizeSummaryText(data.summary);
+        if (typeof data.summary === "string") {
+          data.summary = window.CopilotText?.sanitizeSummaryText(data.summary) ?? String(data.summary).trim();
+        }
 
         if (style === "direct") {
           const row = document.createElement("div");
-          row.className = "chat-message-row bot";
+          row.className = "chat-message-row bot chat-enter";
           const avatar = document.createElement("span");
           avatar.className = "copilot-avatar small";
           avatar.textContent = "✦";
           const div = document.createElement("div");
           div.className = "chat-bubble bot";
           div.textContent = data.summary || "—";
-          row.append(avatar, div);
+          const stack = document.createElement("div");
+          stack.appendChild(div);
+          const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+          if (chart) stack.appendChild(chart);
+          row.append(avatar, stack);
           chat.appendChild(row);
           chat.scrollTop = chat.scrollHeight;
           return;
@@ -199,7 +106,7 @@
 
         if (style === "analytical") {
           const block = document.createElement("article");
-          block.className = "copilot-answer-block";
+          block.className = "copilot-answer-block chat-enter";
           const head = document.createElement("div");
           head.className = "copilot-answer-head";
           const avatar = document.createElement("span");
@@ -250,6 +157,8 @@
             secAct.append(hA, pA);
             block.appendChild(secAct);
           }
+          const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+          if (chart) block.appendChild(chart);
 
           chat.appendChild(block);
           chat.scrollTop = chat.scrollHeight;
@@ -258,7 +167,7 @@
 
         if (style === "records" && records.length === 0) {
           const row = document.createElement("div");
-          row.className = "chat-message-row bot";
+          row.className = "chat-message-row bot chat-enter";
           const avatar = document.createElement("span");
           avatar.className = "copilot-avatar small";
           avatar.textContent = "✦";
@@ -272,7 +181,7 @@
         }
 
         const block = document.createElement("article");
-        block.className = "copilot-answer-block";
+        block.className = "copilot-answer-block chat-enter";
         const head = document.createElement("div");
         head.className = "copilot-answer-head";
         const avatar = document.createElement("span");
@@ -317,9 +226,13 @@
           const hT = document.createElement("h4");
           hT.textContent = "Matching Records";
           secTbl.appendChild(hT);
-          secTbl.appendChild(buildInlineRecordsTable(records, 240));
+          secTbl.appendChild(
+            window.CopilotRenderers?.buildInlineRecordsTable(records, 240, "team_copilot_records.csv")
+          );
           block.appendChild(secTbl);
         }
+        const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+        if (chart) block.appendChild(chart);
 
         const rec = (data.recommended_action || "").trim();
         if (rec) {
@@ -340,8 +253,12 @@
 
       async function ask(question) {
         if (!question.trim()) return;
-        appendChatBubble("user", question);
-        const typing = showTypingIndicator();
+        state.lastQuestion = question;
+        window.CopilotUI?.setAskButtonLoading("askBtn", true, "Ask Copilot");
+        window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "warn", "Reconnecting...");
+        const startedAt = performance.now();
+        window.CopilotChat?.appendBubble("chatHistory", "user", question);
+        const typing = window.CopilotChat?.showTyping("chatHistory");
         try {
           const { ok, data } = await apiFetch("/ask", {
             method: "POST",
@@ -354,11 +271,33 @@
             state.sessionId = data.session_id;
             sessionStorage.setItem("teamCopilotSessionId", state.sessionId);
           }
+          window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "ok", "API Connected");
           appendStructuredCopilotMessage(data);
         } catch (err) {
           typing.remove();
-          appendChatBubble("bot", String(err));
+          window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "error", "API Issue");
+          appendChatErrorWithRetry(String(err), state.lastQuestion);
+          window.CopilotUI?.showToast("Copilot request failed. You can retry.", "error");
+        } finally {
+          window.CopilotUI?.setAskButtonLoading("askBtn", false, "Ask Copilot");
+          window.CopilotUI?.setLatency("copilotLatencyMeta", performance.now() - startedAt);
         }
+      }
+
+      function appendChatErrorWithRetry(errorText, retryQuestion) {
+        const row = window.CopilotChat?.appendBubble("chatHistory", "bot", errorText);
+        if (!row || !retryQuestion) return;
+        const wrap = document.createElement("div");
+        wrap.className = "chat-error-actions";
+        const retryBtn = document.createElement("button");
+        retryBtn.type = "button";
+        retryBtn.className = "ghost-btn chat-retry-btn";
+        retryBtn.textContent = "Retry";
+        retryBtn.addEventListener("click", () => {
+          ask(retryQuestion);
+        });
+        wrap.appendChild(retryBtn);
+        row.appendChild(wrap);
       }
 
       document.getElementById("askBtn").addEventListener("click", () => {
@@ -381,10 +320,12 @@
         });
       });
 
-      appendChatBubble(
+      window.CopilotChat?.appendBubble(
+        "chatHistory",
         "bot",
         "Welcome. Answers use the same CSV your admin uploaded (active_invoices.csv). Ask any finance question."
       );
+      window.CopilotChat?.ensureEmptyState("chatHistory");
     </script>
   </body>
 </html>

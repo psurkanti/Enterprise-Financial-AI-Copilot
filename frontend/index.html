@@ -48,6 +48,32 @@
         </header>
 
         <section id="dashboardPage" class="page active">
+          <div class="dashboard-controls panel">
+            <div class="dashboard-control-group">
+              <label for="dashboardStatusFilter">Status Filter</label>
+              <select id="dashboardStatusFilter">
+                <option value="all">All Statuses</option>
+                <option value="overdue">Overdue Only</option>
+                <option value="pending">Pending Only</option>
+                <option value="paid">Paid Only</option>
+              </select>
+            </div>
+            <div class="dashboard-control-group">
+              <label for="dashboardTopN">Top Regions</label>
+              <select id="dashboardTopN">
+                <option value="5">Top 5</option>
+                <option value="8" selected>Top 8</option>
+                <option value="12">Top 12</option>
+              </select>
+            </div>
+            <div id="dashboardInsightText" class="dashboard-insight-text muted">
+              Analytics insights update automatically when filters change.
+            </div>
+            <div class="dashboard-control-actions">
+              <button id="clearDashboardDrilldownBtn" class="ghost-btn" type="button">Clear Drilldown</button>
+            </div>
+          </div>
+
           <div class="kpi-grid">
             <div class="kpi-card">
               <div class="kpi-icon">$</div>
@@ -82,25 +108,25 @@
           </div>
 
           <div class="charts-grid charts-grid-2x2">
-            <div class="panel">
+            <div class="panel analytics-panel">
               <h3>Total Outstanding Balance</h3>
               <div class="chart-area">
                 <canvas id="outstandingChart"></canvas>
               </div>
             </div>
-            <div class="panel">
+            <div class="panel analytics-panel">
               <h3>Overdue Percentage</h3>
               <div class="chart-area">
                 <canvas id="overdueChart"></canvas>
               </div>
             </div>
-            <div class="panel">
+            <div class="panel analytics-panel">
               <h3>Risk by Region</h3>
               <div class="chart-area">
                 <canvas id="riskRegionChart"></canvas>
               </div>
             </div>
-            <div class="panel">
+            <div class="panel analytics-panel">
               <h3>Aging Bucket Analysis</h3>
               <div class="chart-area">
                 <canvas id="agingBucketChart"></canvas>
@@ -138,12 +164,30 @@
           <div class="panel">
             <h3>Upload Data</h3>
             <div id="dropZone" class="drop-zone">
-              <p>Drag and drop CSV here or click to browse</p>
-              <input id="csvFile" type="file" accept=".csv" />
-              <button id="uploadBtn" class="primary-btn">Upload CSV</button>
+              <p>Drag and drop CSV/XLSX here or click to browse</p>
+              <input id="csvFile" type="file" accept=".csv,.xlsx,.xls" />
+              <button id="uploadBtn" class="primary-btn upload-primary-btn">Upload & Preview</button>
+            </div>
+            <div class="upload-control-row">
+              <label for="uploadedBy" class="upload-label">Uploaded By</label>
+              <input id="uploadedBy" type="text" placeholder="Enter uploader name" value="admin" />
+              <button id="activatePreviewBtn" class="ghost-btn" disabled>Activate Previewed Dataset</button>
             </div>
             <p id="uploadMsg" class="muted"></p>
-            <p>Active dataset: <strong id="activeDataset">None</strong></p>
+            <div class="quick-actions">
+              <select id="activeDatasetSelector"></select>
+              <button id="refreshDatasetsBtn" class="ghost-btn">Refresh Datasets</button>
+            </div>
+            <article class="active-dataset-card">
+              <h4>Active Dataset</h4>
+              <div class="active-dataset-grid">
+                <div><span>Name</span><strong id="activeDatasetName">None</strong></div>
+                <div><span>Rows</span><strong id="activeDatasetRows">0</strong></div>
+                <div><span>Uploaded By</span><strong id="activeDatasetUploadedBy">-</strong></div>
+                <div><span>Uploaded At</span><strong id="activeDatasetUploadedAt">-</strong></div>
+                <div><span>Status</span><strong id="activeDatasetStatusBadge" class="status-badge status-inactive">Inactive</strong></div>
+              </div>
+            </article>
           </div>
 
           <div class="panel">
@@ -165,6 +209,24 @@
             <div class="table-wrap">
               <table id="previewTable">
                 <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>Upload History</h3>
+            <div class="table-wrap">
+              <table id="datasetHistoryTable">
+                <thead>
+                  <tr>
+                    <th>Dataset</th>
+                    <th>Uploaded At</th>
+                    <th>Uploaded By</th>
+                    <th>Rows</th>
+                    <th>Active</th>
+                  </tr>
+                </thead>
                 <tbody></tbody>
               </table>
             </div>
@@ -197,6 +259,10 @@
                 <input id="question" type="text" placeholder="Ask anything about invoices, risk, regions, or collections…" autocomplete="off" />
                 <button id="askBtn" class="copilot-send-btn" type="button">Ask Copilot</button>
               </div>
+              <div class="copilot-meta-row-bottom">
+                <div id="copilotLatencyMeta" class="copilot-latency-meta muted">Last response: —</div>
+                <span id="copilotConnectionBadge" class="copilot-connection-badge status-ok">API Connected</span>
+              </div>
             </div>
           </div>
         </section>
@@ -228,6 +294,12 @@
 
       </main>
     </div>
+    <div id="toastRoot" class="toast-root" aria-live="polite" aria-atomic="true"></div>
+    <script src="./shared-api.js"></script>
+    <script src="./shared-chat.js"></script>
+    <script src="./shared-renderers.js"></script>
+    <script src="./shared-text.js"></script>
+    <script src="./shared-ui.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

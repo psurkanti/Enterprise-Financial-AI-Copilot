@@ -5,3 +5,5 @@ httpx
 pandas
 python-multipart
 openai
+google-generativeai
+openpyxl

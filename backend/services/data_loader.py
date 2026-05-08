@@ -139,10 +139,17 @@ def load_active_csv(upload_dir: Path, active_file: Optional[Path] = None) -> pd.
             raise FileNotFoundError(
                 f"No active dataset at {active_file}. Upload a CSV on the Admin Upload Data page."
             )
+        ext = active_file.suffix.lower()
+        if ext in {".xlsx", ".xls"}:
+            return prepare_invoice_frame(pd.read_excel(active_file))
         return prepare_invoice_frame(pd.read_csv(active_file))
 
     upload_dir.mkdir(parents=True, exist_ok=True)
-    csv_files = sorted(upload_dir.glob("*.csv"))
+    csv_files = sorted(upload_dir.glob("*.csv")) + sorted(upload_dir.glob("*.xlsx")) + sorted(upload_dir.glob("*.xls"))
     if not csv_files:
-        raise FileNotFoundError(f"No CSV found in {upload_dir}. Please upload one.")
-    return prepare_invoice_frame(pd.read_csv(csv_files[0]))
+        raise FileNotFoundError(f"No CSV/XLSX found in {upload_dir}. Please upload one.")
+    first = csv_files[0]
+    ext = first.suffix.lower()
+    if ext in {".xlsx", ".xls"}:
+        return prepare_invoice_frame(pd.read_excel(first))
+    return prepare_invoice_frame(pd.read_csv(first))

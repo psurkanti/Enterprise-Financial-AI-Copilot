@@ -10,6 +10,9 @@ const ACTIVE_DATASET_KEY = "activeDatasetName";
 const state = {
   apiBase: API_BASE_CANDIDATES[0],
   activeDataset: localStorage.getItem(ACTIVE_DATASET_KEY) || "None",
+  pendingDatasetId: "",
+  datasets: [],
+  activeDatasetMeta: null,
   summary: null,
   records: [],
   sessionId: sessionStorage.getItem("copilotSessionId") || "",
@@ -17,6 +20,15 @@ const state = {
   hasActiveDataset: false,
   currentReportType: "aging",
   currentReportRows: [],
+  lastQuestion: "",
+  dashboardFilters: {
+    status: "all",
+    topNRegions: 8,
+  },
+  dashboardDrilldown: {
+    type: "",
+    value: "",
+  },
   charts: {
     outstanding: null,
     overdue: null,
@@ -25,31 +37,16 @@ const state = {
   },
 };
 
+function setActivateButtonEnabled(enabled) {
+  const btn = document.getElementById("activatePreviewBtn");
+  if (!btn) return;
+  btn.disabled = !enabled;
+}
+
 async function apiFetch(path, options = {}) {
-  let lastErr = null;
-  for (const base of API_BASE_CANDIDATES) {
-    try {
-      const res = await fetch(`${base}${path}`, options);
-      const raw = await res.text();
-      let data = {};
-      try {
-        data = raw ? JSON.parse(raw) : {};
-      } catch (_err) {
-        data = { detail: raw.slice(0, 180) };
-      }
-      // If this endpoint returned HTML, it is likely not the backend API on this port.
-      const looksLikeHtml = /^\s*</.test(raw || "");
-      if (looksLikeHtml && !res.headers.get("content-type")?.includes("application/json")) {
-        lastErr = new Error(`Non-JSON response from ${base}${path}`);
-        continue;
-      }
-      state.apiBase = base;
-      return { ok: res.ok, status: res.status, data };
-    } catch (err) {
-      lastErr = err;
-    }
-  }
-  throw lastErr || new Error("Could not connect to backend API.");
+  return window.CopilotApi.fetchWithFallback(path, options, API_BASE_CANDIDATES, (base) => {
+    state.apiBase = base;
+  });
 }
 
 function currency(v) {
@@ -81,6 +78,7 @@ function setDashboardLoading(loading) {
   const shell = document.getElementById("appShell");
   if (!shell) return;
   shell.classList.toggle("loading", Boolean(loading));
+  shell.setAttribute("aria-busy", loading ? "true" : "false");
 }
 
 function clearKpiPlaceholders() {
@@ -99,7 +97,7 @@ async function fetchSummary() {
       state.hasActiveDataset = false;
       state.summary = null;
       clearKpiPlaceholders();
-      document.getElementById("activeDataset").textContent = state.activeDataset || "None";
+      document.getElementById("activeDatasetName").textContent = state.activeDataset || "None";
       document.getElementById("dataStatusText").textContent =
         typeof data.detail === "string"
           ? data.detail
@@ -112,7 +110,7 @@ async function fetchSummary() {
       state.activeDataset = "active_invoices.csv";
     }
     localStorage.setItem(ACTIVE_DATASET_KEY, state.activeDataset);
-    document.getElementById("activeDataset").textContent = state.activeDataset;
+    document.getElementById("activeDatasetName").textContent = state.activeDataset;
     document.getElementById("kpiTotalDue").textContent = currency(data.total_due);
     document.getElementById("kpiTotalInvoices").textContent = data.total_invoices;
     document.getElementById("kpiOverdueInvoices").textContent = data.overdue_invoices;
@@ -122,7 +120,7 @@ async function fetchSummary() {
   } catch (err) {
     state.hasActiveDataset = false;
     state.summary = null;
-    document.getElementById("activeDataset").textContent = state.activeDataset || "None";
+    document.getElementById("activeDatasetName").textContent = state.activeDataset || "None";
     clearKpiPlaceholders();
     document.getElementById("dataStatusText").textContent =
       `Could not refresh server data right now (${String(err)}). Last known dataset: ${state.activeDataset || "None"}.`;
@@ -170,9 +168,66 @@ function destroyChart(chart) {
   if (chart && typeof chart.destroy === "function") chart.destroy();
 }
 
+function getDashboardBaseRecords() {
+  const statusFilter = state.dashboardFilters?.status || "all";
+  if (statusFilter === "all") return state.records || [];
+  return (state.records || []).filter((r) => String(r.status || "").toLowerCase() === statusFilter);
+}
+
+function getDashboardDrilldownRecords() {
+  const base = getDashboardBaseRecords();
+  const type = state.dashboardDrilldown?.type || "";
+  const value = state.dashboardDrilldown?.value || "";
+  if (!type || !value) return base;
+  if (type === "region" || type === "risk_region") {
+    return base.filter((r) => String(r.region || "Unknown") === value);
+  }
+  if (type === "aging_bucket") {
+    return base.filter((r) => String(r.aging_bucket || "Unknown") === value);
+  }
+  if (type === "overdue_share") {
+    return base.filter((r) => {
+      const status = String(r.status || "").toLowerCase();
+      return value === "Overdue" ? status === "overdue" : status !== "overdue";
+    });
+  }
+  return base;
+}
+
+function renderDashboardTableFromState() {
+  const rows = getDashboardDrilldownRecords();
+  renderRecentTable(rows);
+  const drillLabel = state.dashboardDrilldown?.type
+    ? ` | Drilldown: ${state.dashboardDrilldown.type} = ${state.dashboardDrilldown.value}`
+    : "";
+  document.getElementById("dataStatusText").textContent =
+    `Active dataset: ${state.activeDataset} | ${rows.length} records in view${drillLabel}`;
+}
+
+function setDashboardDrilldown(type, value) {
+  state.dashboardDrilldown = { type: String(type || ""), value: String(value || "") };
+  renderDashboardTableFromState();
+}
+
+function toggleDashboardDrilldown(type, value) {
+  const currentType = state.dashboardDrilldown?.type || "";
+  const currentValue = state.dashboardDrilldown?.value || "";
+  if (currentType === type && currentValue === value) {
+    state.dashboardDrilldown = { type: "", value: "" };
+  } else {
+    state.dashboardDrilldown = { type: String(type || ""), value: String(value || "") };
+  }
+  renderDashboardCharts(state.records || []);
+}
+
 function renderDashboardCharts(records) {
   const hasChartLib = typeof Chart !== "undefined";
   if (!hasChartLib) return;
+  const statusFilter = state.dashboardFilters?.status || "all";
+  const topNRegions = Number(state.dashboardFilters?.topNRegions || 8);
+  const filteredRecords = statusFilter === "all"
+    ? records
+    : records.filter((r) => String(r.status || "").toLowerCase() === statusFilter);
 
   const outstandingMap = {};
   const riskMap = {};
@@ -181,7 +236,7 @@ function renderDashboardCharts(records) {
   let totalOutstanding = 0;
   let overdueCount = 0;
 
-  records.forEach((row) => {
+  filteredRecords.forEach((row) => {
     const amount = Number(row.invoice_amount_due || 0);
     const region = row.region || "Unknown";
     const status = String(row.status || "").toLowerCase();
@@ -200,30 +255,59 @@ function renderDashboardCharts(records) {
     if (status === "overdue") overdueCount += 1;
   });
 
-  const overduePct = records.length ? (overdueCount / records.length) * 100 : 0;
+  const overduePct = filteredRecords.length ? (overdueCount / filteredRecords.length) * 100 : 0;
 
   const outstandingEntries = Object.entries(outstandingMap)
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 8);
+    .slice(0, topNRegions);
   const riskEntries = Object.entries(riskMap)
     .map(([region, stat]) => [region, stat.count ? stat.totalRisk / stat.count : 0])
     .sort((a, b) => b[1] - a[1]);
   const agingEntries = Object.entries(agingMap).sort((a, b) => b[1] - a[1]);
+  const focusedRegion = ["region", "risk_region"].includes(state.dashboardDrilldown?.type)
+    ? state.dashboardDrilldown?.value
+    : "";
 
   const outstandingCtx = document.getElementById("outstandingChart");
   const overdueCtx = document.getElementById("overdueChart");
   const riskCtx = document.getElementById("riskRegionChart");
   const agingCtx = document.getElementById("agingBucketChart");
+  const insight = document.getElementById("dashboardInsightText");
   if (!outstandingCtx || !overdueCtx || !riskCtx || !agingCtx) return;
 
   destroyChart(state.charts.outstanding);
+  const outstandingLabels = outstandingEntries.map(([label]) => label);
+  const outstandingValues = outstandingEntries.map(([, v]) => Number(v.toFixed(2)));
+  const outstandingColors = outstandingLabels.map((label) => {
+    if (!focusedRegion) return "#3b82f6";
+    return label === focusedRegion ? "#1d4ed8" : "rgba(147, 197, 253, 0.45)";
+  });
   state.charts.outstanding = new Chart(outstandingCtx, {
     type: "bar",
     data: {
-      labels: outstandingEntries.map(([label]) => label),
-      datasets: [{ label: "Outstanding", data: outstandingEntries.map(([, v]) => Number(v.toFixed(2))), backgroundColor: "#3b82f6", borderRadius: 8 }],
+      labels: outstandingLabels,
+      datasets: [{ label: "Outstanding", data: outstandingValues, backgroundColor: outstandingColors, borderRadius: 8 }],
     },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } } },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 700, easing: "easeOutQuart" },
+      onClick: (_event, elements, chart) => {
+        if (!elements?.length) return;
+        const idx = elements[0].index;
+        const region = chart?.data?.labels?.[idx];
+        if (!region) return;
+        toggleDashboardDrilldown("region", region);
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.label}: ${currency(ctx.raw)}`,
+          },
+        },
+      },
+    },
   });
 
   destroyChart(state.charts.overdue);
@@ -233,17 +317,55 @@ function renderDashboardCharts(records) {
       labels: ["Overdue", "Non-Overdue"],
       datasets: [{ data: [Number(overduePct.toFixed(2)), Number((100 - overduePct).toFixed(2))], backgroundColor: ["#ef4444", "#93c5fd"] }],
     },
-    options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.label}: ${ctx.raw}%` } } } },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 700, easing: "easeOutQuart" },
+      onClick: (_event, elements, chart) => {
+        if (!elements?.length) return;
+        const idx = elements[0].index;
+        const label = chart?.data?.labels?.[idx];
+        if (!label) return;
+        toggleDashboardDrilldown("overdue_share", label);
+      },
+      plugins: { tooltip: { callbacks: { label: (ctx) => `${ctx.label}: ${ctx.raw}%` } } },
+    },
   });
 
   destroyChart(state.charts.riskByRegion);
+  const riskLabels = riskEntries.map(([label]) => label);
+  const riskValues = riskEntries.map(([, v]) => Number(v.toFixed(1)));
+  const riskPointBg = riskLabels.map((label) => {
+    if (!focusedRegion) return "#1d4ed8";
+    return label === focusedRegion ? "#1e40af" : "rgba(147, 197, 253, 0.7)";
+  });
+  const riskPointRadius = riskLabels.map((label) => (focusedRegion && label === focusedRegion ? 5 : 3));
   state.charts.riskByRegion = new Chart(riskCtx, {
     type: "radar",
     data: {
-      labels: riskEntries.map(([label]) => label),
-      datasets: [{ label: "Avg Risk Score", data: riskEntries.map(([, v]) => Number(v.toFixed(1))), borderColor: "#1d4ed8", backgroundColor: "rgba(37, 99, 235, 0.25)" }],
+      labels: riskLabels,
+      datasets: [{
+        label: "Avg Risk Score",
+        data: riskValues,
+        borderColor: "#1d4ed8",
+        backgroundColor: "rgba(37, 99, 235, 0.25)",
+        pointBackgroundColor: riskPointBg,
+        pointRadius: riskPointRadius,
+      }],
     },
-    options: { responsive: true, maintainAspectRatio: false, scales: { r: { suggestedMin: 0, suggestedMax: 100 } } },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 700, easing: "easeOutQuart" },
+      onClick: (_event, elements, chart) => {
+        if (!elements?.length) return;
+        const idx = elements[0].index;
+        const region = chart?.data?.labels?.[idx];
+        if (!region) return;
+        toggleDashboardDrilldown("risk_region", region);
+      },
+      scales: { r: { suggestedMin: 0, suggestedMax: 100 } },
+    },
   });
 
   destroyChart(state.charts.agingBucket);
@@ -253,8 +375,36 @@ function renderDashboardCharts(records) {
       labels: agingEntries.map(([label]) => label),
       datasets: [{ label: "Amount Due", data: agingEntries.map(([, v]) => Number(v.toFixed(2))), borderColor: "#0ea5e9", backgroundColor: "rgba(14,165,233,0.2)", fill: true, tension: 0.3 }],
     },
-    options: { responsive: true, maintainAspectRatio: false },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 700, easing: "easeOutQuart" },
+      onClick: (_event, elements, chart) => {
+        if (!elements?.length) return;
+        const idx = elements[0].index;
+        const bucket = chart?.data?.labels?.[idx];
+        if (!bucket) return;
+        toggleDashboardDrilldown("aging_bucket", bucket);
+      },
+      plugins: {
+        tooltip: {
+          callbacks: {
+            label: (ctx) => `${ctx.dataset.label}: ${currency(ctx.raw)}`,
+          },
+        },
+      },
+    },
   });
+
+  const topRegion = outstandingEntries[0]?.[0] || "N/A";
+  const totalAmountLabel = currency(totalOutstanding);
+  if (insight) {
+    const drill = state.dashboardDrilldown?.type
+      ? ` Drilldown active on ${state.dashboardDrilldown.type}: ${state.dashboardDrilldown.value}.`
+      : "";
+    insight.textContent = `Showing ${filteredRecords.length} records (${statusFilter}). Total outstanding: ${totalAmountLabel}. Top region: ${topRegion}.${drill}`;
+  }
+  renderDashboardTableFromState();
 }
 
 function renderRecentTable(records) {
@@ -289,12 +439,11 @@ function applyDashboardSearch() {
   }
 
   if (!query) {
-    renderRecentTable(state.records);
-    document.getElementById("dataStatusText").textContent = `Active dataset: ${state.activeDataset} | ${state.records.length} records loaded`;
+    renderDashboardTableFromState();
     return;
   }
 
-  const matches = state.records.filter((row) => {
+  const matches = getDashboardDrilldownRecords().filter((row) => {
     const customer = String(row.customer_name || "").toLowerCase();
     const invoice = String(row.invoice_id || "").toLowerCase();
     const region = String(row.region || "").toLowerCase();
@@ -332,6 +481,79 @@ function renderPreviewTable(records) {
     });
     tbody.appendChild(tr);
   });
+}
+
+function renderDatasetHistory(datasets) {
+  const tbody = document.querySelector("#datasetHistoryTable tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  datasets.forEach((ds) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${ds.dataset_name || "-"}</td>
+      <td>${(ds.uploaded_at || "").replace("T", " ").slice(0, 19)}</td>
+      <td>${ds.uploaded_by || "-"}</td>
+      <td>${Number(ds.rows || 0)}</td>
+      <td>${ds.is_active ? "Yes" : "No"}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+function renderDatasetSelector(datasets, activeId) {
+  const sel = document.getElementById("activeDatasetSelector");
+  if (!sel) return;
+  sel.innerHTML = "";
+  datasets.forEach((ds) => {
+    const opt = document.createElement("option");
+    opt.value = ds.dataset_id;
+    opt.textContent = `${ds.dataset_name} (${ds.rows} rows)`;
+    if (ds.dataset_id === activeId) opt.selected = true;
+    sel.appendChild(opt);
+  });
+}
+
+function renderActiveDatasetCard(dataset) {
+  const nameEl = document.getElementById("activeDatasetName");
+  const rowsEl = document.getElementById("activeDatasetRows");
+  const atEl = document.getElementById("activeDatasetUploadedAt");
+  const byEl = document.getElementById("activeDatasetUploadedBy");
+  const statusEl = document.getElementById("activeDatasetStatusBadge");
+  if (!nameEl || !rowsEl || !atEl || !byEl || !statusEl) return;
+  if (!dataset) {
+    nameEl.textContent = "None";
+    rowsEl.textContent = "0";
+    atEl.textContent = "-";
+    byEl.textContent = "-";
+    statusEl.textContent = "Inactive";
+    statusEl.classList.remove("status-active");
+    statusEl.classList.add("status-inactive");
+    return;
+  }
+  nameEl.textContent = dataset.dataset_name || "Unknown";
+  rowsEl.textContent = String(Number(dataset.rows || 0));
+  atEl.textContent = String(dataset.uploaded_at || "").replace("T", " ").slice(0, 19) || "-";
+  byEl.textContent = dataset.uploaded_by || "-";
+  const isActive = Boolean(dataset.is_active);
+  statusEl.textContent = isActive ? "Active" : "Inactive";
+  statusEl.classList.toggle("status-active", isActive);
+  statusEl.classList.toggle("status-inactive", !isActive);
+}
+
+async function refreshDatasets() {
+  const { ok, data } = await apiFetch("/datasets", { cache: "no-store" });
+  if (!ok) throw new Error(data.detail || "Could not load dataset history.");
+  state.datasets = data.datasets || [];
+  const active = state.datasets.find((d) => d.dataset_id === data.active_dataset_id) || state.datasets.find((d) => d.is_active);
+  if (active) {
+    state.activeDatasetMeta = active;
+    state.activeDataset = active.dataset_name || "active";
+    localStorage.setItem(ACTIVE_DATASET_KEY, state.activeDataset);
+    document.getElementById("activeDatasetName").textContent = state.activeDataset;
+  }
+  renderActiveDatasetCard(active || null);
+  renderDatasetHistory(state.datasets);
+  renderDatasetSelector(state.datasets, data.active_dataset_id);
 }
 
 function renderRecords(records) {
@@ -556,142 +778,19 @@ function renderCurrentReport() {
   renderReportSummaryStrip(rows);
 }
 
-function showTypingIndicator() {
-  const chat = document.getElementById("chatHistory");
-  const row = document.createElement("div");
-  row.className = "copilot-typing-row";
-  const avatar = document.createElement("span");
-  avatar.className = "copilot-avatar";
-  avatar.textContent = "✦";
-  const dots = document.createElement("div");
-  dots.className = "typing-dots";
-  for (let i = 0; i < 3; i += 1) {
-    dots.appendChild(document.createElement("span"));
-  }
-  row.append(avatar, dots);
-  chat.appendChild(row);
-  chat.scrollTop = chat.scrollHeight;
-  return row;
-}
-
-function buildInlineRecordsTable(records, maxHeightPx) {
-  const wrap = document.createElement("div");
-  wrap.className = "table-wrap copilot-inline-table";
-  if (maxHeightPx) wrap.style.maxHeight = `${maxHeightPx}px`;
-  const table = document.createElement("table");
-  const thead = document.createElement("thead");
-  const tbody = document.createElement("tbody");
-  if (!records || records.length === 0) {
-    const tr = document.createElement("tr");
-    const td = document.createElement("td");
-    td.textContent = "No matching rows for this answer.";
-    tr.appendChild(td);
-    tbody.appendChild(tr);
-    table.append(thead, tbody);
-    wrap.appendChild(table);
-    return wrap;
-  }
-  const columns = Object.keys(records[0]);
-  const hr = document.createElement("tr");
-  columns.forEach((c) => {
-    const th = document.createElement("th");
-    th.textContent = c;
-    hr.appendChild(th);
-  });
-  thead.appendChild(hr);
-  records.forEach((row) => {
-    const tr = document.createElement("tr");
-    columns.forEach((c) => {
-      const td = document.createElement("td");
-      td.textContent = row[c] ?? "";
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
-  });
-  table.append(thead, tbody);
-  wrap.appendChild(table);
-  return wrap;
-}
-
-function sanitizeSummaryText(text) {
-  const t = String(text || "").trim();
-  if (!t) return t;
-  // JS does not support inline modifiers like (?is). Use [\s\S]*? to mimic dotall.
-  let out = t;
-  out = out.replace(
-    /^\s*(enterprise financial ai copilot|our copilot)\s+(found|identified|located)\s+[\s\S]*?(?:\.\s*)?$/i,
-    ""
-  );
-  out = out.replace(/found\s+\d+\s+matching\s+records\b[\s\S]*?(?:\.\s*)?$/i, "");
-  out = out.replace(/\bmatching\s+records\b/i, "");
-  return out.trim();
-}
-
-function parseMarkdownTable(text) {
-  const lines = String(text || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-  const tableStart = lines.findIndex((line, idx) => line.includes("|") && idx + 1 < lines.length && /^\|?\s*[-:| ]+\|?\s*$/.test(lines[idx + 1]));
-  if (tableStart < 0) return null;
-
-  const rowLines = [];
-  for (let i = tableStart; i < lines.length; i += 1) {
-    if (!lines[i].includes("|")) break;
-    rowLines.push(lines[i]);
-  }
-  if (rowLines.length < 2) return null;
-
-  const parseRow = (row) =>
-    row
-      .replace(/^\||\|$/g, "")
-      .split("|")
-      .map((cell) => cell.trim());
-
-  const headers = parseRow(rowLines[0]);
-  const dataRows = rowLines.slice(2).map(parseRow).filter((cells) => cells.length === headers.length);
-  if (!headers.length || !dataRows.length) return null;
-  return { headers, rows: dataRows };
-}
-
-function renderMarkdownTable(tableData) {
-  const wrap = document.createElement("div");
-  wrap.className = "table-wrap copilot-inline-table";
-  wrap.style.maxHeight = "220px";
-  const table = document.createElement("table");
-  const thead = document.createElement("thead");
-  const tbody = document.createElement("tbody");
-  const hr = document.createElement("tr");
-  tableData.headers.forEach((h) => {
-    const th = document.createElement("th");
-    th.textContent = h;
-    hr.appendChild(th);
-  });
-  thead.appendChild(hr);
-  tableData.rows.forEach((r) => {
-    const tr = document.createElement("tr");
-    r.forEach((value) => {
-      const td = document.createElement("td");
-      td.textContent = value;
-      tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
-  });
-  table.append(thead, tbody);
-  wrap.appendChild(table);
-  return wrap;
-}
-
 function appendStructuredCopilotMessage(data) {
   const chat = document.getElementById("chatHistory");
+  window.CopilotChat?.clearEmptyState("chatHistory");
   const style = data.response_style || "direct";
   const records = data.matching_records || [];
 
-  if (typeof data.summary === "string") data.summary = sanitizeSummaryText(data.summary);
+  if (typeof data.summary === "string") {
+    data.summary = window.CopilotText?.sanitizeSummaryText(data.summary) ?? String(data.summary).trim();
+  }
 
   if (style === "direct") {
     const row = document.createElement("div");
-    row.className = "chat-message-row bot";
+    row.className = "chat-message-row bot chat-enter";
     const avatar = document.createElement("span");
     avatar.className = "copilot-avatar small";
     avatar.setAttribute("aria-hidden", "true");
@@ -699,16 +798,24 @@ function appendStructuredCopilotMessage(data) {
     const div = document.createElement("div");
     div.className = "chat-bubble bot";
     const summaryText = data.summary || "—";
-    const mdTable = parseMarkdownTable(summaryText);
+    const mdTable = window.CopilotText?.parseMarkdownTable(summaryText) ?? null;
     if (mdTable) {
       div.textContent = summaryText.split("\n").find((line) => !line.includes("|")) || "Here is the requested table:";
       const stack = document.createElement("div");
+      stack.className = "chat-enter";
       stack.appendChild(div);
-      stack.appendChild(renderMarkdownTable(mdTable));
+      stack.appendChild(window.CopilotText?.renderMarkdownTable(mdTable));
+      const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+      if (chart) stack.appendChild(chart);
       row.append(avatar, stack);
     } else {
       div.textContent = summaryText;
-      row.append(avatar, div);
+      const stack = document.createElement("div");
+      stack.className = "chat-enter";
+      stack.appendChild(div);
+      const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+      if (chart) stack.appendChild(chart);
+      row.append(avatar, stack);
     }
     chat.appendChild(row);
     chat.scrollTop = chat.scrollHeight;
@@ -717,7 +824,7 @@ function appendStructuredCopilotMessage(data) {
 
   if (style === "analytical") {
     const block = document.createElement("article");
-    block.className = "copilot-answer-block";
+    block.className = "copilot-answer-block chat-enter";
     const head = document.createElement("div");
     head.className = "copilot-answer-head";
     const avatar = document.createElement("span");
@@ -769,6 +876,8 @@ function appendStructuredCopilotMessage(data) {
       secAct.append(hA, pA);
       block.appendChild(secAct);
     }
+    const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+    if (chart) block.appendChild(chart);
 
     chat.appendChild(block);
     chat.scrollTop = chat.scrollHeight;
@@ -777,7 +886,7 @@ function appendStructuredCopilotMessage(data) {
 
   if (style === "records" && records.length === 0) {
     const row = document.createElement("div");
-    row.className = "chat-message-row bot";
+    row.className = "chat-message-row bot chat-enter";
     const avatar = document.createElement("span");
     avatar.className = "copilot-avatar small";
     avatar.setAttribute("aria-hidden", "true");
@@ -792,7 +901,7 @@ function appendStructuredCopilotMessage(data) {
   }
 
   const block = document.createElement("article");
-  block.className = "copilot-answer-block";
+  block.className = "copilot-answer-block chat-enter";
 
   const head = document.createElement("div");
   head.className = "copilot-answer-head";
@@ -839,9 +948,11 @@ function appendStructuredCopilotMessage(data) {
     const hT = document.createElement("h4");
     hT.textContent = "Matching Records";
     secTbl.appendChild(hT);
-    secTbl.appendChild(buildInlineRecordsTable(records, 240));
+    secTbl.appendChild(window.CopilotRenderers?.buildInlineRecordsTable(records, 240));
     block.appendChild(secTbl);
   }
+  const chart = window.CopilotRenderers?.buildInlineChart(data.chart_data);
+  if (chart) block.appendChild(chart);
 
   const secAct = document.createElement("section");
   secAct.className = "copilot-answer-section";
@@ -861,8 +972,12 @@ function appendStructuredCopilotMessage(data) {
 }
 
 async function askQuestion(question) {
-  appendChatBubble("user", question);
-  const typing = showTypingIndicator();
+  state.lastQuestion = question;
+  window.CopilotUI?.setAskButtonLoading("askBtn", true, "Ask Copilot");
+  window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "warn", "Reconnecting...");
+  const startedAt = performance.now();
+  window.CopilotChat?.appendBubble("chatHistory", "user", question);
+  const typing = window.CopilotChat?.showTyping("chatHistory");
   try {
     const { ok, data } = await apiFetch("/ask", {
       method: "POST",
@@ -875,10 +990,16 @@ async function askQuestion(question) {
       state.sessionId = data.session_id;
       sessionStorage.setItem("copilotSessionId", state.sessionId);
     }
+    window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "ok", "API Connected");
     appendStructuredCopilotMessage(data);
   } catch (err) {
     typing.remove();
-    appendChatBubble("bot", String(err));
+    window.CopilotUI?.setConnectionStatus("copilotConnectionBadge", "error", "API Issue");
+    appendChatErrorWithRetry(String(err), state.lastQuestion);
+    window.CopilotUI?.showToast("Copilot request failed. You can retry.", "error");
+  } finally {
+    window.CopilotUI?.setAskButtonLoading("askBtn", false, "Ask Copilot");
+    window.CopilotUI?.setLatency("copilotLatencyMeta", performance.now() - startedAt);
   }
 }
 
@@ -886,20 +1007,38 @@ async function uploadCsv() {
   const msg = document.getElementById("uploadMsg");
   const fileInput = document.getElementById("csvFile");
   if (!fileInput.files || fileInput.files.length === 0) {
-    msg.textContent = "Please select a CSV file.";
+    msg.textContent = "Please select a CSV/XLSX file.";
     return;
   }
+  const uploadedBy = (document.getElementById("uploadedBy")?.value || "admin").trim() || "admin";
   const form = new FormData();
   form.append("file", fileInput.files[0]);
-  const { ok, data } = await apiFetch("/upload-csv", { method: "POST", body: form });
-  if (!ok) throw new Error(data.detail || "Upload failed");
+  form.append("uploaded_by", uploadedBy);
+  const { ok, data } = await apiFetch("/datasets/preview", { method: "POST", body: form });
+  if (!ok) throw new Error(data.detail || "Preview failed");
+  state.pendingDatasetId = data?.dataset?.dataset_id || "";
+  setActivateButtonEnabled(Boolean(state.pendingDatasetId));
+  renderPreviewTable(data.preview_rows || []);
+  const uploaded = data?.dataset?.rows != null ? ` (${data.dataset.rows} rows)` : "";
+  document.getElementById("uploadMsg").textContent =
+    `${data.message || "Preview ready"}${uploaded}. Click "Activate Previewed Dataset" to switch.`;
+  window.CopilotUI?.showToast("Dataset preview loaded.", "success");
+  await refreshDatasets();
+}
+
+async function activateDataset(datasetId) {
+  if (!datasetId) return;
+  const form = new FormData();
+  form.append("dataset_id", datasetId);
+  const { ok, data } = await apiFetch("/datasets/activate", { method: "POST", body: form });
+  if (!ok) throw new Error(data.detail || "Activation failed");
   state.sessionId = "";
   sessionStorage.removeItem("copilotSessionId");
-  state.activeDataset = data.file || "active_invoices.csv";
-  localStorage.setItem(ACTIVE_DATASET_KEY, state.activeDataset);
-  document.getElementById("activeDataset").textContent = state.activeDataset;
-  const uploaded = data.rows != null ? ` Saved ${data.rows} rows.` : "";
-  document.getElementById("uploadMsg").textContent = (data.message || "Upload successful.") + uploaded;
+  state.pendingDatasetId = "";
+  setActivateButtonEnabled(false);
+  document.getElementById("uploadMsg").textContent = data.message || "Active dataset updated.";
+  window.CopilotUI?.showToast("Active dataset updated.", "success");
+  await refreshDatasets();
   await refreshAll();
 }
 
@@ -928,28 +1067,20 @@ function switchPage(pageId) {
   searchInput.style.display = showTopSearch ? "" : "none";
 }
 
-function appendChatBubble(role, text) {
-  const chat = document.getElementById("chatHistory");
-  const row = document.createElement("div");
-  row.className = `chat-message-row ${role}`;
-  if (role === "bot") {
-    const avatar = document.createElement("span");
-    avatar.className = "copilot-avatar small";
-    avatar.setAttribute("aria-hidden", "true");
-    avatar.textContent = "✦";
-    const div = document.createElement("div");
-    div.className = `chat-bubble ${role}`;
-    div.textContent = text;
-    row.append(avatar, div);
-  } else {
-    const div = document.createElement("div");
-    div.className = `chat-bubble ${role}`;
-    div.textContent = text;
-    row.appendChild(div);
-  }
-  chat.appendChild(row);
-  chat.scrollTop = chat.scrollHeight;
-  return row;
+function appendChatErrorWithRetry(errorText, retryQuestion) {
+  const row = window.CopilotChat?.appendBubble("chatHistory", "bot", errorText);
+  if (!row || !retryQuestion) return;
+  const wrap = document.createElement("div");
+  wrap.className = "chat-error-actions";
+  const retryBtn = document.createElement("button");
+  retryBtn.type = "button";
+  retryBtn.className = "ghost-btn chat-retry-btn";
+  retryBtn.textContent = "Retry";
+  retryBtn.addEventListener("click", () => {
+    askQuestion(retryQuestion);
+  });
+  wrap.appendChild(retryBtn);
+  row.appendChild(wrap);
 }
 
 async function refreshAll() {
@@ -992,7 +1123,7 @@ function setupLogin() {
     document.getElementById("uploadMsg").textContent = "";
     loginPage.classList.add("hidden");
     shell.classList.remove("hidden");
-    appendChatBubble("bot", "Hello Admin. Ask any invoice or risk question to start analysis.");
+    window.CopilotChat?.appendBubble("chatHistory", "bot", "Hello Admin. Ask any invoice or risk question to start analysis.");
     await refreshAll();
   });
 }
@@ -1019,6 +1150,41 @@ document.getElementById("uploadBtn").addEventListener("click", async () => {
     await uploadCsv();
   } catch (err) {
     document.getElementById("uploadMsg").textContent = String(err);
+    window.CopilotUI?.showToast(String(err), "error");
+  }
+});
+
+document.getElementById("activatePreviewBtn")?.addEventListener("click", async () => {
+  try {
+    const target = state.pendingDatasetId || document.getElementById("activeDatasetSelector")?.value;
+    if (!target) {
+      document.getElementById("uploadMsg").textContent = "Upload a file first, then activate it.";
+      return;
+    }
+    await activateDataset(target);
+  } catch (err) {
+    document.getElementById("uploadMsg").textContent = String(err);
+    window.CopilotUI?.showToast(String(err), "error");
+  }
+});
+
+document.getElementById("activeDatasetSelector")?.addEventListener("change", async (event) => {
+  const id = event.target?.value;
+  if (!id) return;
+  try {
+    await activateDataset(id);
+  } catch (err) {
+    document.getElementById("uploadMsg").textContent = String(err);
+    window.CopilotUI?.showToast(String(err), "error");
+  }
+});
+
+document.getElementById("refreshDatasetsBtn")?.addEventListener("click", async () => {
+  try {
+    await refreshDatasets();
+  } catch (err) {
+    document.getElementById("uploadMsg").textContent = String(err);
+    window.CopilotUI?.showToast(String(err), "error");
   }
 });
 
@@ -1030,7 +1196,8 @@ document.getElementById("askBtn").addEventListener("click", async () => {
   try {
     await askQuestion(question);
   } catch (err) {
-    appendChatBubble("bot", String(err));
+    window.CopilotChat?.appendBubble("chatHistory", "bot", String(err));
+    window.CopilotUI?.showToast(String(err), "error");
   }
 });
 
@@ -1066,7 +1233,23 @@ document.getElementById("searchInput").addEventListener("input", applyDashboardS
 document.getElementById("searchInput").addEventListener("keydown", (event) => {
   if (event.key === "Enter") applyDashboardSearch();
 });
+document.getElementById("dashboardStatusFilter")?.addEventListener("change", (event) => {
+  state.dashboardFilters.status = event.target?.value || "all";
+  state.dashboardDrilldown = { type: "", value: "" };
+  renderDashboardCharts(state.records || []);
+});
+document.getElementById("dashboardTopN")?.addEventListener("change", (event) => {
+  state.dashboardFilters.topNRegions = Number(event.target?.value || 8);
+  renderDashboardCharts(state.records || []);
+});
+document.getElementById("clearDashboardDrilldownBtn")?.addEventListener("click", () => {
+  state.dashboardDrilldown = { type: "", value: "" };
+  renderDashboardCharts(state.records || []);
+});
 
 document.getElementById("todayDate").textContent = new Date().toLocaleDateString();
 setupUploadDropzone();
 setupLogin();
+setActivateButtonEnabled(false);
+refreshDatasets().catch(() => {});
+window.CopilotChat?.ensureEmptyState("chatHistory");

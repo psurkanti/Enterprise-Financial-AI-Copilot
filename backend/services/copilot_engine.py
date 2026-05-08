@@ -8,47 +8,42 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from backend.services.ai_provider import AIProviderRouter
 from backend.services.chat_memory import ConversationState
-
-try:
-    from openai import OpenAI
-except Exception:  # pragma: no cover
-    OpenAI = None  # type: ignore
+from backend.services.query_executor import QueryExecutor
+from backend.services.query_intents import QueryIntentRouter
+from backend.services.query_planner import QuestionPlanner
+from backend.services.query_utils import (
+    aggregation_by_region_question as util_aggregation_by_region_question,
+    currency as util_currency,
+    extract_amount as util_extract_amount,
+    extract_invoice_token as util_extract_invoice_token,
+    extract_recent_days_window as util_extract_recent_days_window,
+    format_due_date as util_format_due_date,
+    has_financial_invoice_context as util_has_financial_invoice_context,
+    high_risk_mask as util_high_risk_mask,
+    is_count_question as util_is_count_question,
+    is_region_catalog_question as util_is_region_catalog_question,
+    to_records as util_to_records,
+)
+from backend.services.response_formatter import ResponseFormatter
 
 
 def _currency(v: float) -> str:
-    return f"${v:,.2f}"
+    return util_currency(v)
 
 
 def _to_records(frame: pd.DataFrame, limit: int = 100) -> List[Dict[str, Any]]:
-    selected = frame.head(limit).copy()
-    for col in selected.columns:
-        if pd.api.types.is_datetime64_any_dtype(selected[col]) or pd.api.types.is_timedelta64_dtype(selected[col]):
-            selected[col] = selected[col].astype(str)
-    selected = selected.where(pd.notna(selected), None)
-    if "due_date" in selected.columns:
-        selected["due_date"] = selected["due_date"].astype(str)
-    return selected.to_dict(orient="records")
+    return util_to_records(frame, limit=limit)
 
 
 def _extract_amount(text: str) -> Optional[float]:
-    m = re.search(r"\$?\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*([kKmM]?)", text)
-    if not m:
-        return None
-    value = float(m.group(1).replace(",", ""))
-    suffix = m.group(2).lower()
-    if suffix == "k":
-        value *= 1000
-    elif suffix == "m":
-        value *= 1_000_000
-    return value
+    return util_extract_amount(text)
 
 
 CLARIFY_MESSAGE = (
-    "I can answer questions about customer_name, invoice_id, amount_due/balance_remaining, amount_paid, "
-    "invoice_date, due_date, payment_date, status, region, risk_score, aging_bucket, payment_method, "
-    "collection_priority, customer_segment, assigned_collector, and invoice_category. "
-    "Could you rephrase your question?"
+    "I can only answer questions related to uploaded financial datasets. "
+    "Please ask about columns like customer_name, invoice_id, due_date, payment_date, status, region, or risk_score."
 )
 
 _FINANCE_TOPIC_PATTERN = re.compile(
@@ -115,37 +110,19 @@ def _user_wants_tabular_invoice_list(q: str) -> bool:
 
 
 def _is_count_question(q: str) -> bool:
-    q = q.lower()
-    return (
-        "how many" in q
-        or re.search(r"\bcount\b", q) is not None
-        or "number of" in q
-        or re.search(r"\btotal\s+number\b", q) is not None
-    )
+    return util_is_count_question(q)
 
 
 def _aggregation_by_region_question(q: str) -> bool:
-    q = q.lower()
-    if "region" not in q and "regions" not in q:
-        return False
-    if _is_region_catalog_question(q):
-        return False
-    if not any(x in q for x in ("by region", "per region", "each region", "grouped by region")):
-        return False
-    if re.search(r"\bdue\b", q) or re.search(r"\bar\b", q):
-        return True
-    return any(x in q for x in ("total", "sum", "balance", "outstanding", "amount"))
+    return util_aggregation_by_region_question(q)
 
 
 def _extract_invoice_token(question: str) -> Optional[str]:
-    m = _INV_TOKEN_PATTERN.search(question.upper())
-    if m:
-        return m.group(1).upper()
-    return None
+    return util_extract_invoice_token(question)
 
 
 def _high_risk_mask(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce").fillna(0) >= 70.0
+    return util_high_risk_mask(series)
 
 
 def _sanitize_answer_text(text: str) -> str:
@@ -186,21 +163,7 @@ def _customers_mentioned(frame: pd.DataFrame, question: str) -> List[str]:
 
 
 def _has_financial_invoice_context(q: str) -> bool:
-    """Avoid substring traps like 'due' matching inside 'total'."""
-    ql = q.lower()
-    if "invoice" in ql or "invoices" in ql:
-        return True
-    if any(w in ql for w in ("amount", "balance", "overdue", "risk", "aging", "collect", "outstanding", "unpaid")):
-        return True
-    if re.search(r"\bpaid\b", ql) or re.search(r"\bpay\b", ql):
-        return True
-    if re.search(r"\bdue\b", ql) or re.search(r"\bdue date\b", ql):
-        return True
-    if " average" in ql or " avg" in ql or re.search(r"\bavg\b", ql) or re.search(r"\bmean\b", ql):
-        return True
-    if "per region" in ql or "by region" in ql:
-        return True
-    return False
+    return util_has_financial_invoice_context(q)
 
 
 _DAY_WORDS = {
@@ -229,113 +192,15 @@ _DAY_WORDS = {
 
 
 def _extract_recent_days_window(q: str) -> Optional[int]:
-    ql = q.lower()
-    if "last week" in ql or "past week" in ql:
-        return 7
-    m = re.search(r"\b(?:last|past|previous)\s+(\d{1,3})\s+days?\b", ql)
-    if m:
-        n = int(m.group(1))
-        return n if n > 0 else None
-    m2 = re.search(r"\b(?:last|past|previous)\s+([a-z]+)\s+days?\b", ql)
-    if m2 and m2.group(1) in _DAY_WORDS:
-        return _DAY_WORDS[m2.group(1)]
-    return None
+    return util_extract_recent_days_window(q)
 
 
 def _format_due_date(val: Any) -> str:
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return "unknown"
-    if hasattr(val, "date"):
-        try:
-            return str(val.date())
-        except Exception:
-            return str(val)[:10]
-    s = str(val)
-    return s[:10] if s else "unknown"
+    return util_format_due_date(val)
 
 
 def _is_region_catalog_question(q: str) -> bool:
-    """True when the user only wants a region count and/or region names (not AR analytics)."""
-    if "region" not in q and "regions" not in q:
-        return False
-    if "customer" in q:
-        return False
-    if "invoice" in q and ("per region" in q or "by region" in q):
-        return False
-    if any(
-        x in q
-        for x in (
-            "highest",
-            "largest",
-            "lowest",
-            "least",
-            "summarize",
-            "breakdown",
-            "ar risk",
-            "outstanding balance",
-            "total due",
-            "average ",
-            "avg ",
-            "mean ",
-            "collection ",
-            "overdue ",
-        )
-    ):
-        return False
-    if "which region" in q and any(x in q for x in ("highest", "most", "largest", "best", "worst", "least")):
-        return False
-
-    if bool(
-        "how many region" in q
-        or "how many regions" in q
-        or "number of region" in q
-        or "number of regions" in q
-        or "count region" in q
-        or "count regions" in q
-        or "count of region" in q
-        or "regions in total" in q
-        or "region in total" in q
-        or "what are the region" in q
-        or "what regions" in q
-        or "which regions are" in q
-        or "which regions we" in q
-        or "list region" in q
-        or "list regions" in q
-        or "list the region" in q
-        or "all the region" in q
-        or "all region" in q
-        or "all regions" in q
-        or "distinct region" in q
-        or "unique region" in q
-        or "regions do we" in q
-        or "region do we" in q
-        or "regions are there" in q
-        or "regions exist" in q
-        or "total number of region" in q
-    ):
-        return True
-
-    # How many / list-style region questions without invoice/AR context
-    if _has_financial_invoice_context(q):
-        return False
-    return any(
-        phrase in q
-        for phrase in (
-            "how many",
-            "number of",
-            "count ",
-            "count of",
-            "what region",
-            "which region",
-            "list region",
-            "list regions",
-            "name the region",
-            "region names",
-            "every region",
-            "all region",
-            "we have",
-        )
-    )
+    return util_is_region_catalog_question(q)
 
 
 def _wants_recommendation(q: str) -> bool:
@@ -432,9 +297,25 @@ def _regions_from_question(q: str, regions: List[str]) -> List[str]:
 
 class CopilotEngine:
     def __init__(self) -> None:
-        self._api_key = os.getenv("OPENAI_API_KEY", "")
-        self._model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        self._client = OpenAI(api_key=self._api_key) if (self._api_key and OpenAI) else None
+        self._ai = AIProviderRouter()
+        self._planner = QuestionPlanner(self._ai)
+        self._executor = QueryExecutor()
+        self._formatter = ResponseFormatter(self._ai)
+        self._intents = QueryIntentRouter(
+            payload_direct_fn=self._payload_direct,
+            count_regions_fn=self._count_regions,
+            answer_paid_amount_fn=self._answer_paid_amount_question,
+            to_records_fn=_to_records,
+            relevant_columns_fn=_relevant_columns_for_question,
+            extract_invoice_token_fn=_extract_invoice_token,
+            customers_mentioned_fn=_customers_mentioned,
+            high_risk_mask_fn=_high_risk_mask,
+            is_region_catalog_question_fn=_is_region_catalog_question,
+            aggregation_by_region_question_fn=_aggregation_by_region_question,
+            currency_fn=_currency,
+            format_due_date_fn=_format_due_date,
+            user_wants_tabular_fn=_user_wants_tabular_invoice_list,
+        )
 
     @staticmethod
     def _payload_direct(summary: str, intent: str, response_type: str) -> Dict[str, Any]:
@@ -527,275 +408,23 @@ class CopilotEngine:
     def _try_intent_based_answer(
         self, frame: pd.DataFrame, question: str, memory: ConversationState
     ) -> Optional[Dict[str, Any]]:
-        qlow = question.lower().strip()
-        want_table = _user_wants_tabular_invoice_list(qlow)
-
-        if (
-            re.search(r"\bwhich\s+region\b", qlow)
-            and re.search(r"\b(highest|most|largest|top)\b", qlow)
-            and re.search(r"\b(balance|outstanding|due|ar|amount)\b", qlow)
-            and {"region", "invoice_amount_due"}.issubset(frame.columns)
-        ):
-            g = (
-                frame.groupby("region", as_index=False)["invoice_amount_due"]
-                .sum()
-                .rename(columns={"invoice_amount_due": "total_due"})
-                .sort_values("total_due", ascending=False)
-            )
-            if g.empty:
-                return self._payload_direct("No regional balances were found.", "highest_region_balance", "LOOKUP")
-            top = g.iloc[0]
-            if not want_table:
-                return self._payload_direct(
-                    f"{top['region']} has the highest outstanding balance at {_currency(float(top['total_due']))}.",
-                    "highest_region_balance",
-                    "LOOKUP",
-                )
-            return {
-                "summary": f"{top['region']} has the highest outstanding balance at {_currency(float(top['total_due']))}.",
-                "key_findings": [],
-                "recommended_action": "",
-                "matching_records": _to_records(g, limit=100),
-                "intent": "highest_region_balance",
-                "response_type": "AGGREGATION",
-                "response_style": "records",
-            }
-
-        if ("due this week" in qlow or "due in this week" in qlow or "this week's due" in qlow) and "due_date" in frame.columns:
-            start = pd.Timestamp.utcnow().normalize()
-            end = start + pd.Timedelta(days=7)
-            due = frame[(frame["due_date"].notna()) & (frame["due_date"] >= start) & (frame["due_date"] < end)]
-            due = due.sort_values("due_date", ascending=True)
-            total = float(pd.to_numeric(due.get("invoice_amount_due"), errors="coerce").fillna(0).sum()) if "invoice_amount_due" in due.columns else 0.0
-            cols = _relevant_columns_for_question(due, question)
-            due_show = due[cols] if cols else due
-            if not want_table:
-                return self._payload_direct(
-                    f"{len(due)} invoices are due this week totaling {_currency(total)}.",
-                    "due_this_week",
-                    "AGGREGATION",
-                )
-            return {
-                "summary": f"{len(due)} invoices are due this week totaling {_currency(total)}.",
-                "key_findings": [],
-                "recommended_action": "",
-                "matching_records": _to_records(due_show, limit=100),
-                "intent": "due_this_week",
-                "response_type": "FILTERED_RECORDS",
-                "response_style": "records",
-            }
-
-        if any(x in qlow for x in ("highest risk customer", "customer has highest risk", "which customer has highest risk")):
-            if "risk_score" in frame.columns and "customer_name" in frame.columns:
-                work = frame.copy()
-                work["risk_score"] = pd.to_numeric(work["risk_score"], errors="coerce").fillna(0)
-                idx = int(work["risk_score"].idxmax()) if not work.empty else -1
-                if idx >= 0:
-                    row = work.loc[idx]
-                    due_amt = float(pd.to_numeric(row.get("invoice_amount_due"), errors="coerce") or 0.0)
-                    return self._payload_direct(
-                        f"{row.get('customer_name', 'Unknown')} has the highest risk score ({float(row['risk_score']):.1f}) with invoice exposure {_currency(due_amt)}.",
-                        "highest_risk_customer",
-                        "LOOKUP",
-                    )
-
-        if "overdue exposure" in qlow:
-            if {"due_date", "status", "invoice_amount_due"}.issubset(frame.columns):
-                today = pd.Timestamp.utcnow().date()
-                overdue = frame[
-                    frame["due_date"].notna()
-                    & (pd.to_datetime(frame["due_date"], errors="coerce").dt.date < today)
-                    & (frame["status"].astype(str).str.lower().str.strip() != "paid")
-                ]
-                total = float(pd.to_numeric(overdue["invoice_amount_due"], errors="coerce").fillna(0).sum())
-                return self._payload_direct(
-                    f"Overdue exposure is {_currency(total)} across {len(overdue)} invoices.",
-                    "overdue_exposure",
-                    "AGGREGATION",
-                )
-
-        if _is_region_catalog_question(qlow):
-            return self._count_regions(frame, {}, question)
-
-        if _aggregation_by_region_question(qlow):
-            if "region" in frame.columns and "invoice_amount_due" in frame.columns:
-                g = (
-                    frame.groupby("region", as_index=False)["invoice_amount_due"]
-                    .sum()
-                    .rename(columns={"invoice_amount_due": "total_due"})
-                    .sort_values("total_due", ascending=False)
-                )
-                summary = "Total due by region: " + "; ".join(
-                    f"{str(r['region']).strip()} {_currency(float(r['total_due']))}" for _, r in g.iterrows()
-                )
-                return {
-                    "summary": summary,
-                    "key_findings": [],
-                    "recommended_action": "",
-                    "matching_records": _to_records(g, limit=100),
-                    "intent": "aggregation_region",
-                    "response_type": "AGGREGATION",
-                    "response_style": "records",
-                }
-
-        if "overdue" in qlow and "customer" in qlow and any(
-            x in qlow for x in ("name", "names", "list", "who", "which", "give", "show", "tell")
-        ):
-            if {"due_date", "status"}.issubset(frame.columns) and "customer_name" in frame.columns:
-                today = pd.Timestamp.utcnow().date()
-                od = frame[
-                    frame["due_date"].notna()
-                    & (pd.to_datetime(frame["due_date"], errors="coerce").dt.date < today)
-                    & (frame["status"].astype(str).str.lower().str.strip() != "paid")
-                ]
-                if od.empty:
-                    return self._payload_direct(
-                        "There are no overdue invoices in the current data.",
-                        "overdue_customers",
-                        "UNIQUE_VALUES",
-                    )
-                names = sorted(
-                    {str(x).strip() for x in od["customer_name"].dropna().astype(str).unique() if str(x).strip()}
-                )
-                listed = ", ".join(names[:80])
-                tail = f" (+{len(names) - 80} more)" if len(names) > 80 else ""
-                return self._payload_direct(
-                    f"Overdue customers: {listed}{tail}.",
-                    "overdue_customer_names",
-                    "UNIQUE_VALUES",
-                )
-
-        paid_reply = self._answer_paid_amount_question(frame, question)
-        if paid_reply is not None:
-            return paid_reply
-
-        inv = _extract_invoice_token(question)
-        if inv and "invoice_id" in frame.columns:
-            rows = frame[frame["invoice_id"].astype(str).str.upper().str.strip() == inv]
-            if not rows.empty:
-                r = rows.iloc[0]
-                if any(k in qlow for k in ("due date", "when is", "when does")) or (
-                    "due" in qlow and "date" in qlow
-                ):
-                    dd = _format_due_date(r.get("due_date"))
-                    return self._payload_direct(
-                        f"The due date for invoice {inv} is {dd}.",
-                        "lookup_due_date",
-                        "LOOKUP",
-                    )
-                if any(k in qlow for k in ("amount", "balance")) and "customer" not in qlow:
-                    amt = float(pd.to_numeric(r.get("invoice_amount_due"), errors="coerce") or 0)
-                    return self._payload_direct(
-                        f"The amount due for invoice {inv} is {_currency(amt)}.",
-                        "lookup_amount",
-                        "LOOKUP",
-                    )
-                if "status" in qlow:
-                    st = str(r.get("status", ""))
-                    return self._payload_direct(
-                        f"The status for invoice {inv} is {st}.",
-                        "lookup_status",
-                        "LOOKUP",
-                    )
-                if "customer" in qlow or "who" in qlow:
-                    cn = str(r.get("customer_name", ""))
-                    return self._payload_direct(
-                        f"Invoice {inv} is for customer {cn}.",
-                        "lookup_customer",
-                        "LOOKUP",
-                    )
-
-        if ("invoice id" in qlow or "invoice number" in qlow) and "customer_name" in frame.columns:
-            cnames = _customers_mentioned(frame, question)
-            if cnames and "invoice_id" in frame.columns:
-                sub = frame[frame["customer_name"].isin(cnames)]
-                if not sub.empty:
-                    ids = sorted({str(x).strip() for x in sub["invoice_id"].dropna().astype(str).unique() if str(x).strip()})
-                    if ids:
-                        cust = cnames[0]
-                        if len(ids) == 1:
-                            return self._payload_direct(
-                                f"The invoice ID for {cust} is {ids[0]}.",
-                                "lookup_invoice_ids",
-                                "LOOKUP",
-                            )
-                        joined = ", ".join(ids[:20])
-                        extra = f" (+{len(ids) - 20} more)" if len(ids) > 20 else ""
-                        return {
-                            "summary": f"Invoice IDs for {cust}: {joined}{extra}.",
-                            "key_findings": [],
-                            "recommended_action": "",
-                            "matching_records": [{"invoice_id": i, "customer_name": cust} for i in ids[:80]],
-                            "intent": "lookup_invoice_ids",
-                            "response_type": "LOOKUP",
-                            "response_style": "records",
-                        }
-
-        if "high risk" in qlow or "high-risk" in qlow:
-            if "risk_score" not in frame.columns:
-                return None
-            hr = frame[_high_risk_mask(frame["risk_score"])]
-            if hr.empty:
-                return self._payload_direct(
-                    "There are no high-risk rows in this dataset (risk_score ≥ 70).",
-                    "count_high_risk",
-                    "COUNT",
-                )
-            nu = int(hr["customer_name"].nunique()) if "customer_name" in hr.columns else len(hr)
-            if _is_count_question(qlow) and "customer" in qlow:
-                return self._payload_direct(
-                    f"There are {nu} high-risk customers.",
-                    "count_high_risk",
-                    "COUNT",
-                )
-            if any(w in qlow for w in ("which", "who", "what customers", "list", "show", "name")):
-                cols = [c for c in ("customer_name", "risk_score", "region") if c in hr.columns]
-                if "customer_name" in hr.columns:
-                    slim = hr.drop_duplicates(subset=["customer_name"])[cols].head(200)
-                else:
-                    slim = hr[cols].head(200)
-                names = sorted({str(x) for x in hr["customer_name"].dropna().astype(str).unique()})
-                tail = ""
-                if len(names) > 20:
-                    tail = f" (+{len(names) - 20} more)"
-                show_names = ", ".join(names[:20])
-                return {
-                    "summary": f"High-risk customers (risk_score ≥ 70): {show_names}{tail}.",
-                    "key_findings": [],
-                    "recommended_action": "",
-                    "matching_records": _to_records(slim, limit=100),
-                    "intent": "list_high_risk_customers",
-                    "response_type": "FILTERED_RECORDS",
-                    "response_style": "records",
-                }
-
-        return None
+        return self._intents.route(frame, question, memory)
 
     def _llm_polish_answer(self, question: str, draft: str, row_count: int) -> str:
-        if not self._client or not (draft or "").strip():
+        if not self._ai.available() or not (draft or "").strip():
             return ""
         try:
-            completion = self._client.chat.completions.create(
-                model=self._model,
+            text = self._ai.complete_text(
+                system_prompt=(
+                    "You answer finance questions in plain language only. "
+                    "Never mention product names, assistants, or dashboards. "
+                    "Never say 'found X matching records'. Answer directly in one or two short sentences. "
+                    "Use only facts from the draft; do not invent numbers."
+                ),
+                user_prompt=f"Question: {question}\nDraft: {draft}\nRows in scope: {row_count}",
                 temperature=0.15,
                 max_tokens=120,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You answer finance questions in plain language only. "
-                            "Never mention product names, assistants, or dashboards. "
-                            "Never say 'found X matching records'. Answer the question directly in one or two short sentences. "
-                            "Use only facts from the draft; do not invent numbers."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Question: {question}\nDraft: {draft}\nRows in scope: {row_count}",
-                    },
-                ],
             )
-            text = (completion.choices[0].message.content or "").strip()
             return text if text else ""
         except Exception:
             return ""
@@ -922,7 +551,7 @@ class CopilotEngine:
         return f"{n} invoices, {_currency(total_due)} total due."
 
     def _llm_plan(self, frame: pd.DataFrame, question: str, memory: ConversationState) -> Dict[str, Any]:
-        if not self._client:
+        if not self._ai.available():
             return {}
 
         sample = frame.head(12).fillna("").to_dict(orient="records")
@@ -975,16 +604,12 @@ User question: {question}
 Sample rows: {json.dumps(sample, default=str)}
 """
         try:
-            completion = self._client.chat.completions.create(
-                model=self._model,
+            parsed = self._ai.complete_json(
+                system_prompt="Output valid JSON only.",
+                user_prompt=prompt,
                 temperature=0.1,
-                messages=[
-                    {"role": "system", "content": "Output valid JSON only."},
-                    {"role": "user", "content": prompt},
-                ],
+                max_tokens=550,
             )
-            text = completion.choices[0].message.content or "{}"
-            parsed = json.loads(text)
             if isinstance(parsed, dict):
                 return parsed
         except Exception:
@@ -1150,6 +775,37 @@ Sample rows: {json.dumps(sample, default=str)}
         if _is_region_catalog_question(qlow):
             return self._count_regions(filtered, plan, question)
         sorted_limited = self._apply_sort_limit(filtered, plan)
+        if any(t in qlow for t in ("trend", "over time", "month over month", "weekly")):
+            date_col = "payment_date" if "payment_date" in sorted_limited.columns else ("invoice_date" if "invoice_date" in sorted_limited.columns else None)
+            if date_col and "invoice_amount_due" in sorted_limited.columns:
+                work = sorted_limited.copy()
+                work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+                work = work[work[date_col].notna()]
+                if not work.empty:
+                    trend = (
+                        work.assign(period=work[date_col].dt.to_period("M").astype(str))
+                        .groupby("period", as_index=False)["invoice_amount_due"]
+                        .sum()
+                        .rename(columns={"invoice_amount_due": "total_amount"})
+                        .sort_values("period")
+                    )
+                    summary = f"Trend shows {len(trend)} periods. Latest period amount is {_currency(float(trend.iloc[-1]['total_amount']))}."
+                    want_table = _user_wants_tabular_invoice_list(qlow)
+                    return {
+                        "summary": summary,
+                        "key_findings": [],
+                        "recommended_action": "",
+                        "matching_records": _to_records(trend, limit=100) if want_table else [],
+                        "intent": "trend",
+                        "response_type": "TREND",
+                        "response_style": "records" if want_table else "direct",
+                        "chart_data": {
+                            "kind": "line",
+                            "title": "Trend Over Time",
+                            "labels": [str(x) for x in trend["period"].tolist()],
+                            "values": [float(x) for x in trend["total_amount"].tolist()],
+                        },
+                    }
         summary = self._direct_records_summary(question, sorted_limited)
         want_table = _user_wants_tabular_invoice_list(qlow)
         if want_table:
@@ -1210,7 +866,7 @@ Sample rows: {json.dumps(sample, default=str)}
         qlow = question.lower().strip()
         if _is_count_question(qlow) and not _user_wants_tabular_invoice_list(qlow):
             return {
-                "summary": f"There are {n} unique customers.",
+                "summary": f"{n} customers",
                 "key_findings": [],
                 "recommended_action": "",
                 "matching_records": [],
@@ -1477,7 +1133,7 @@ Sample rows: {json.dumps(sample, default=str)}
     def answer(self, frame: pd.DataFrame, question: str, memory: ConversationState) -> Dict[str, Any]:
         qlow = question.strip().lower()
         if not _question_covers_finance(qlow):
-            return self._finalize_response(
+            return self._formatter.finalize_response(
                 {
                     "summary": CLARIFY_MESSAGE,
                     "key_findings": [],
@@ -1492,23 +1148,9 @@ Sample rows: {json.dumps(sample, default=str)}
 
         routed = self._try_intent_based_answer(frame, question, memory)
         if routed is not None:
-            return self._finalize_response(routed, question)
+            return self._formatter.finalize_response(routed, question)
 
-        fallback = self._fallback_plan(frame, question, memory)
-        llm_plan = self._llm_plan(frame, question, memory)
-        if llm_plan:
-            merged = dict(fallback)
-            merged.update({k: v for k, v in llm_plan.items() if v is not None and v != [] and v != {}})
-            if isinstance(llm_plan.get("filters"), dict):
-                lf = {k: v for k, v in llm_plan["filters"].items() if v not in (None, [], {})}
-                if lf:
-                    base_f = dict(merged.get("filters") or {})
-                    base_f.update(lf)
-                    merged["filters"] = base_f
-            raw_plan = merged
-        else:
-            raw_plan = fallback
-        plan = self._sanitize_plan(raw_plan)
+        plan = self._planner.build_plan(frame, question, memory)
 
         if _is_region_catalog_question(qlow):
             plan["analysis"] = "count_regions"
@@ -1517,7 +1159,7 @@ Sample rows: {json.dumps(sample, default=str)}
         if analysis == "overview" and not plan.get("use_previous_subset"):
             raw = self._overview(frame)
         else:
-            filtered = self._narrow_frame(frame, plan, memory)
+            filtered = self._executor.narrow_frame(frame, plan, memory)
             if analysis == "overview":
                 raw = self._overview(filtered)
             elif analysis == "count_customers":
@@ -1537,5 +1179,5 @@ Sample rows: {json.dumps(sample, default=str)}
             else:
                 raw = self._build_from_records(filtered, plan, frame, question)
 
-        return self._finalize_response(raw, question)
+        return self._formatter.finalize_response(raw, question)
 
