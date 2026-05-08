@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.pytest_cache/
+backend/data/uploads/*
+!backend/data/uploads/.gitkeep

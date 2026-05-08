@@ -1,0 +1,2 @@
+customer,amount_due,due date,invoice_status,sales_region,risk,ageing
+Alias Customer,50000,2026-04-01,Overdue,North,72,31-60

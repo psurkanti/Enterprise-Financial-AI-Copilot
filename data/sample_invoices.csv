@@ -1,0 +1,9 @@
+customer_name,invoice_amount_due,due_date,status,region,risk_score,aging_bucket
+Acme Corp,12000,2026-04-10,Pending,North,82,31-60
+Beta Industries,4500,2026-05-01,Pending,South,65,1-30
+Crest Retail,17800,2026-03-20,Overdue,West,91,61-90
+Delta Logistics,2200,2026-06-15,Pending,East,40,Current
+Evergreen Foods,9800,2026-04-28,Overdue,North,74,31-60
+Fusion Health,3500,2026-05-18,Paid,West,15,Current
+Global Tech,14300,2026-02-27,Overdue,South,88,90+
+Horizon Media,6200,2026-06-30,Pending,East,55,Current

@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Enterprise Financial AI Copilot</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <section id="loginPage" class="login-page">
+      <div class="login-card">
+        <div class="brand-lockup">
+          <span class="brand-mark">FC</span>
+          <h1>Enterprise Financial AI Copilot</h1>
+        </div>
+        <p>Sign in to continue to your finance workspace.</p>
+        <input id="loginEmail" type="email" placeholder="Email" />
+        <input id="loginPassword" type="password" placeholder="Password" />
+        <button id="loginBtn" class="primary-btn">Login</button>
+        <p id="loginError" class="error-text"></p>
+        <div class="demo-credentials">
+          <strong>Demo credentials</strong>
+          <span>admin@financecopilot.com / Admin@123</span>
+          <span class="muted">Frontend validation only</span>
+          <span class="muted">No backend auth required</span>
+        </div>
+      </div>
+    </section>
+
+    <div id="appShell" class="layout hidden">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <span class="brand-mark">FC</span>
+          <h1 class="sidebar-logo">Finance Copilot</h1>
+        </div>
+        <button class="nav-btn active" data-page="dashboardPage">Dashboard</button>
+        <button class="nav-btn" data-page="uploadPage">Upload Data</button>
+        <button class="nav-btn" data-page="copilotPage">Financial Copilot</button>
+        <button class="nav-btn" data-page="reportsPage">Reports</button>
+      </aside>
+
+      <main class="main">
+        <header class="top-header">
+          <div>
+            <h2 id="pageTitle">Admin Dashboard</h2>
+            <p id="pageSubtitle"></p>
+          </div>
+          <div class="top-actions">
+            <input id="searchInput" type="text" placeholder="Search customer, invoice, region..." />
+            <button id="refreshBtn" class="ghost-btn">Refresh Data</button>
+            <span id="todayDate" class="date-text"></span>
+          </div>
+        </header>
+
+        <section id="dashboardPage" class="page active">
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-icon">$</div>
+              <span>Total Outstanding Balance</span>
+              <strong id="kpiTotalDue">-</strong>
+              <small>+12% vs last month</small>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-icon">#</div>
+              <span>Total Invoices</span>
+              <strong id="kpiTotalInvoices">-</strong>
+              <small>+4% volume growth</small>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-icon">!</div>
+              <span>Overdue Invoices</span>
+              <strong id="kpiOverdueInvoices">-</strong>
+              <small>Needs collection follow-up</small>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-icon">R</div>
+              <span>High Risk Customers</span>
+              <strong id="kpiHighRisk">-</strong>
+              <small>Risk score 70+ accounts</small>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-icon">G</div>
+              <span>Top Region by Balance</span>
+              <strong id="kpiTopRegion">-</strong>
+              <small>Highest AR concentration</small>
+            </div>
+          </div>
+
+          <div class="charts-grid">
+            <div class="panel">
+              <h3>Outstanding Balance by Region</h3>
+              <div id="regionChart" class="chart-area"></div>
+            </div>
+            <div class="panel">
+              <h3>Invoice Status Distribution</h3>
+              <div id="statusChart" class="chart-area"></div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>Recent Invoices</h3>
+            <div class="table-wrap">
+              <table id="recentTable">
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Invoice ID</th>
+                    <th>Amount Due</th>
+                    <th>Due Date</th>
+                    <th>Status</th>
+                    <th>Region</th>
+                    <th>Risk Score</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3>Data Status</h3>
+            <p id="dataStatusText" class="muted">Waiting for active dataset.</p>
+          </div>
+        </section>
+
+        <section id="uploadPage" class="page">
+          <div class="panel">
+            <h3>Upload Data</h3>
+            <div id="dropZone" class="drop-zone">
+              <p>Drag and drop CSV here or click to browse</p>
+              <input id="csvFile" type="file" accept=".csv" />
+              <button id="uploadBtn" class="primary-btn">Upload CSV</button>
+            </div>
+            <p id="uploadMsg" class="muted"></p>
+            <p>Active dataset: <strong id="activeDataset">None</strong></p>
+          </div>
+
+          <div class="panel">
+            <h3>Required Columns</h3>
+            <ul class="checklist">
+              <li>customer_name</li>
+              <li>invoice_id</li>
+              <li>amount_due</li>
+              <li>due_date</li>
+              <li>status</li>
+              <li>region</li>
+              <li>risk_score</li>
+              <li>aging_bucket</li>
+            </ul>
+          </div>
+
+          <div class="panel">
+            <h3>Data Preview (first 10 rows)</h3>
+            <div class="table-wrap">
+              <table id="previewTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section id="copilotPage" class="page">
+          <div class="copilot-hero">
+            <div class="copilot-hero-main">
+              <h2 class="copilot-product-title">Enterprise Financial AI Copilot</h2>
+              <p class="copilot-product-subtitle">Ask natural language questions over uploaded financial data</p>
+            </div>
+          </div>
+
+          <div class="copilot-prompt-grid" id="copilotPromptCards">
+            <button type="button" class="copilot-prompt-card" data-q="Give me financial overview">Give me financial overview</button>
+            <button type="button" class="copilot-prompt-card" data-q="How many customers do we have?">How many customers do we have?</button>
+            <button type="button" class="copilot-prompt-card" data-q="Show overdue invoices above $50K">Show overdue invoices above $50K</button>
+            <button type="button" class="copilot-prompt-card" data-q="Which customers are high risk?">Which customers are high risk?</button>
+            <button type="button" class="copilot-prompt-card" data-q="Which region has highest outstanding balance?">Which region has highest outstanding balance?</button>
+            <button type="button" class="copilot-prompt-card" data-q="Summarize AR risk by region">Summarize AR risk by region</button>
+            <button type="button" class="copilot-prompt-card" data-q="Show top 10 customers by balance">Show top 10 customers by balance</button>
+            <button type="button" class="copilot-prompt-card" data-q="Give collection priority list">Give collection priority list</button>
+          </div>
+
+          <div class="copilot-layout copilot-layout-premium copilot-chat-full">
+            <div class="panel copilot-chat-card">
+              <div id="chatHistory" class="chat-history chat-history-premium"></div>
+              <div class="chat-compose">
+                <input id="question" type="text" placeholder="Ask anything about invoices, risk, regions, or collections…" autocomplete="off" />
+                <button id="askBtn" class="copilot-send-btn" type="button">Ask Copilot</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="reportsPage" class="page">
+          <div class="panel">
+            <h3>Reports</h3>
+            <p class="muted">Generate finance reports and export CSV files for review meetings.</p>
+            <div class="quick-actions">
+              <button data-report="aging">AR Aging Report</button>
+              <button data-report="overdue">Overdue Customers Report</button>
+              <button data-report="highrisk">High Risk Customers Report</button>
+              <button data-report="region">Region Outstanding Report</button>
+              <button id="downloadCurrentReport">Download Current Report CSV</button>
+            </div>
+          </div>
+
+          <div class="panel">
+            <h3 id="reportTitle">AR Aging Report</h3>
+            <div id="reportSummaryStrip" class="kpi-grid"></div>
+            <div class="table-wrap">
+              <table id="reportTable">
+                <thead></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
